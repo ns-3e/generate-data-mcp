@@ -1,34 +1,37 @@
 {
-  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-06-18/server.schema.json",
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.ns-3e/generate-data-mcp",
+  "title": "Generate-Data",
   "description": "MCP server for Generate-Data.com — synthetic dataset generation, AI schema design, field-type discovery, and Premium Project generation via 7 gd_* tools.",
-  "version": "2.0.0",
   "repository": {
     "url": "https://github.com/ns-3e/generate-data-mcp",
     "source": "github"
   },
+  "version": "2.0.1",
   "packages": [
     {
-      "registry_name": "pypi",
-      "name": "generate-data-mcp",
-      "version": "2.0.0",
-      "runtime_hint": "uvx",
-      "_note": "Package is not yet published to PyPI as of this authoring; run `uvx --from git+https://github.com/ns-3e/generate-data-mcp generate-data-mcp` until the real PyPI release lands.",
-      "environment_variables": [
+      "registryType": "pypi",
+      "identifier": "generate-data-mcp",
+      "version": "2.0.1",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
         {
           "name": "GENERATE_DATA_API_KEY",
           "description": "Generate-Data.com API key (Settings -> API Access). Required.",
-          "is_required": true,
-          "is_secret": true
+          "isRequired": true,
+          "isSecret": true,
+          "format": "string"
         },
         {
           "name": "GENERATE_DATA_API_BASE_URL",
           "description": "Override the Generate-Data.com API base URL (defaults to https://api.generate-data.com).",
-          "is_required": false,
-          "is_secret": false
+          "isRequired": false,
+          "isSecret": false,
+          "format": "string"
         }
       ]
     }
-  ],
-  "_note": "Authored as part of F-005 distribution packaging; not yet submitted to registry.modelcontextprotocol.io. Field shape follows modelcontextprotocol/registry conventions as of authoring — verify against the live schema before publishing."
+  ]
 }
