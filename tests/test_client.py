@@ -1,5 +1,6 @@
-"""Tests for MCP HTTP client (mocked)."""
-import json
+"""Tests for GenerateDataClient (HTTP layer, mocked at the instance's reused
+httpx.Client — `client._http` — per contract Sec. 8 / brief F-008, not the old
+module-level httpx.get/post pattern)."""
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -18,13 +19,19 @@ def test_client_requires_api_key():
             GenerateDataClient()
 
 
+def test_client_reuses_one_httpx_client(client):
+    """brief F-008: one reused httpx.Client per GenerateDataClient instance."""
+    import httpx
+    assert isinstance(client._http, httpx.Client)
+
+
 def test_generate_data_posts_to_v2(client):
     mock_response = MagicMock()
     mock_response.status_code = 200
     mock_response.text = 'first_name\nAlice'
     mock_response.headers = {'content-type': 'text/csv'}
 
-    with patch('generate_data_mcp.client.httpx.post', return_value=mock_response) as post:
+    with patch.object(client._http, 'post', return_value=mock_response) as post:
         resp = client.generate_data([{'name': 'first_name', 'type': 'first_name', 'options': {}}], num_rows=5)
 
     post.assert_called_once()
@@ -40,7 +47,7 @@ def test_list_field_types(client):
     mock_response.status_code = 200
     mock_response.json.return_value = {'categories': {}}
 
-    with patch('generate_data_mcp.client.httpx.get', return_value=mock_response) as get:
+    with patch.object(client._http, 'get', return_value=mock_response) as get:
         data = client.list_field_types()
 
     get.assert_called_once_with(
@@ -56,7 +63,7 @@ def test_get_field_options(client):
     mock_response.status_code = 200
     mock_response.json.return_value = {'options': []}
 
-    with patch('generate_data_mcp.client.httpx.get', return_value=mock_response) as get:
+    with patch.object(client._http, 'get', return_value=mock_response) as get:
         data = client.get_field_options('email')
 
     get.assert_called_once_with(
@@ -72,7 +79,7 @@ def test_propose_schema(client):
     mock_response.status_code = 200
     mock_response.json.return_value = {'proposed_schema': []}
 
-    with patch('generate_data_mcp.client.httpx.post', return_value=mock_response) as post:
+    with patch.object(client._http, 'post', return_value=mock_response) as post:
         data = client.propose_schema('customers with email')
 
     post.assert_called_once()
@@ -87,7 +94,7 @@ def test_refine_schema(client):
 
     messages = [{'role': 'user', 'content': 'add VAT field'}]
     schema = {'fields': []}
-    with patch('generate_data_mcp.client.httpx.post', return_value=mock_response) as post:
+    with patch.object(client._http, 'post', return_value=mock_response) as post:
         data = client.refine_schema(messages, schema)
 
     post.assert_called_once()
@@ -102,7 +109,7 @@ def test_get_usage(client):
     mock_response.status_code = 200
     mock_response.json.return_value = {'calls_today': 3, 'tier': 'FREE'}
 
-    with patch('generate_data_mcp.client.httpx.get', return_value=mock_response) as get:
+    with patch.object(client._http, 'get', return_value=mock_response) as get:
         data = client.get_usage()
 
     get.assert_called_once_with(
@@ -113,31 +120,60 @@ def test_get_usage(client):
     assert data['tier'] == 'FREE'
 
 
-def test_generate_data_tool_error_response():
-    from generate_data_mcp.server import generate_data
-
+def test_list_projects(client):
     mock_response = MagicMock()
-    mock_response.status_code = 429
-    mock_response.json.return_value = {'error': 'Rate limit exceeded', 'code': 'rate_limit'}
-    mock_response.text = 'Rate limit exceeded'
+    mock_response.status_code = 200
+    mock_response.json.return_value = [{'id': 1}, {'id': 2}]
 
-    with patch('generate_data_mcp.server._client') as mock_client:
-        mock_client.return_value.generate_data.return_value = mock_response
-        result = generate_data(fields=[{'name': 'x', 'type': 'first_name', 'options': {}}])
+    with patch.object(client._http, 'get', return_value=mock_response) as get:
+        data = client.list_projects()
 
-    parsed = json.loads(result)
-    assert parsed['status'] == 429
-    assert 'Rate limit' in parsed['error']
+    get.assert_called_once_with(
+        'http://test/api/v2/projects',
+        headers={'X-API-Key': '00000000-0000-0000-0000-000000000001', 'Accept': 'application/json'},
+        timeout=30,
+    )
+    assert data == [{'id': 1}, {'id': 2}]
 
 
-def test_tool_endpoint_mapping():
-    """Documented tools map to v2 paths."""
-    mapping = {
-        'generate_data': '/api/v2/generate',
-        'list_field_types': '/api/v2/field-types',
-        'get_field_options': '/api/v2/field-types/{type}/options',
-        'propose_schema': '/api/v2/ai/schema/propose',
-        'refine_schema': '/api/v2/ai/schema/refine',
-        'get_api_usage': '/api/v2/api-keys/usage',
-    }
-    assert len(mapping) >= 5
+def test_generate_data_binary_format_sends_accept_star(client):
+    """Finding 1: binary generate calls send Accept: */* not application/json,
+    so an upstream honoring Accept doesn't coerce the binary body to JSON."""
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.content = b'PK\x03\x04fake-zip-bytes'
+    mock_response.headers = {'content-type': 'application/zip'}
+
+    with patch.object(client._http, 'post', return_value=mock_response) as post:
+        client.generate_data([{'name': 'first_name', 'type': 'first_name', 'options': {}}], fmt='zip')
+
+    assert post.call_args[1]['headers']['Accept'] == '*/*'
+
+
+def test_generate_data_text_format_keeps_accept_json(client):
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.text = 'first_name\nAlice'
+    mock_response.headers = {'content-type': 'text/csv'}
+
+    with patch.object(client._http, 'post', return_value=mock_response) as post:
+        client.generate_data([{'name': 'first_name', 'type': 'first_name', 'options': {}}], fmt='csv')
+
+    assert post.call_args[1]['headers']['Accept'] == 'application/json'
+
+
+def test_generate_project_posts_with_format_param(client):
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.content = b'PK\x03\x04fake-zip-bytes'
+    mock_response.headers = {'content-type': 'application/zip'}
+
+    with patch.object(client._http, 'post', return_value=mock_response) as post:
+        resp = client.generate_project(42, fmt='zip')
+
+    post.assert_called_once()
+    args, kwargs = post.call_args
+    assert args[0] == 'http://test/api/v2/projects/42/generate'
+    assert kwargs['params'] == {'format': 'zip'}
+    assert kwargs['headers']['Accept'] == '*/*'
+    assert resp.status_code == 200

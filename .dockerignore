@@ -1,0 +1,15 @@
+.venv
+__pycache__
+**/__pycache__
+*.pyc
+.pytest_cache
+tests/__pycache__
+.git
+.gitignore
+.claude
+.cursor
+.DS_Store
+*.egg-info
+dist
+build
+uv.lock

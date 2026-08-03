@@ -1,91 +1,296 @@
-"""MCP stdio server entrypoint."""
+"""MCP stdio server entrypoint.
+
+DOC: F-002 rebuild renames the 5 free-tier tools per the frozen contract
+(`.claude/program/contracts/tool-conventions.md` Sec. 1):
+`generate_data`->`gd_generate_dataset`, `list_field_types`->`gd_list_field_types`,
+`get_field_options`->`gd_get_field_type_options`, `propose_schema`+`refine_schema`
+merged into one `gd_design_schema` (first call proposes; passing both `messages`
+and `current_schema` refines), `get_api_usage`->`gd_get_usage`. This is a
+breaking rename for any existing MCP client config pointing at the old names.
+Premium tools rebuilt by F-003 per the same contract:
+`list_projects`->`gd_list_projects` (paginated), `generate_project`->
+`gd_generate_project` (binary-aware — fixes the F-001/B-001 corruption bug
+where zip bytes were force-decoded as utf-8).
+"""
 import json
-import os
 from typing import Any
 
+import httpx
 from mcp.server.fastmcp import FastMCP
 
+from generate_data_mcp._conventions import (
+    _encode_binary,
+    _encode_text,
+    _err,
+    _ok,
+    _paginate,
+    _validate_field_type,
+    _validate_pagination,
+    _validate_project_id,
+)
 from generate_data_mcp.client import GenerateDataClient
 
 mcp = FastMCP('generate-data')
 
 
+# DOC: process-lifetime singleton — one GenerateDataClient (and its one
+# reused httpx.Client) per stdio server process, per contract Sec. 8 /
+# brief F-008. Do not construct a fresh GenerateDataClient per tool call.
+_client_singleton: GenerateDataClient | None = None
+
+
 def _client() -> GenerateDataClient:
-    return GenerateDataClient()
+    global _client_singleton
+    if _client_singleton is None:
+        _client_singleton = GenerateDataClient()
+    return _client_singleton
+
+
+_DATA_FORMATS = frozenset({'csv', 'json', 'xml', 'parquet', 'zip'})
+_BINARY_FORMATS = frozenset({'parquet', 'zip'})
+
+
+def _classify_http_error(status_code: int, body: Any) -> tuple[str, str, bool]:
+    """Map an upstream HTTP status/body to the contract Sec. 3 (code, message,
+    retriable) tuple. Never includes API key/header data in the message."""
+    upstream_msg = ''
+    if isinstance(body, dict):
+        upstream_msg = str(body.get('error') or body.get('message') or '')
+    lowered = upstream_msg.lower()
+    if status_code == 400:
+        return 'invalid_input', 'Upstream rejected the request as invalid. Check field names, types, and options against gd_list_field_types.', False
+    if status_code in (401, 403):
+        if status_code == 403 and any(kw in lowered for kw in ('tier', 'premium', 'upgrade', 'plan')):
+            return 'tier_forbidden', 'This action requires a higher API tier. Upgrade your Generate-Data.com plan to use it.', False
+        return 'auth_failed', 'Authentication failed. Verify GENERATE_DATA_API_KEY is set to a valid, active API key.', False
+    if status_code == 429:
+        return 'rate_limited', 'Rate limit exceeded. Wait before retrying this call.', True
+    if status_code == 404:
+        return 'not_found', 'The requested id or field_type was not found. Re-check it via gd_list_field_types or gd_list_projects.', False
+    return 'upstream_error', f'Upstream API returned an unexpected error (status {status_code}). Retry later or check service status.', False
+
+
+def _err_from_status(status_code: int, body: Any) -> str:
+    code, message, retriable = _classify_http_error(status_code, body)
+    details: dict[str, Any] = {}
+    if body is not None:
+        # Contract Sec. 3/8: upstream text must be delimited, never interpolated.
+        details['upstream'] = json.dumps(body)
+    return _err(code, message, retriable=retriable, details=details)
+
+
+def _err_from_http_status_error(exc: httpx.HTTPStatusError) -> str:
+    response = exc.response
+    try:
+        body = response.json()
+    except Exception:
+        body = None
+    return _err_from_status(response.status_code, body)
 
 
 @mcp.tool()
-def generate_data(
+def gd_generate_dataset(
     fields: list[dict[str, Any]],
     num_rows: int = 100,
     format: str = 'csv',
     settings: dict[str, Any] | None = None,
 ) -> str:
-    """Generate synthetic data rows. Returns CSV/text content or error message."""
+    """Generate synthetic dataset rows from a field list. Use this when the user
+    wants actual generated data (as opposed to schema design or field-type
+    discovery). `fields` is a list of `{"name": str, "type": str, "options": dict}`
+    (get valid `type` values from `gd_list_field_types`/`gd_get_field_type_options`).
+    `format` must be one of `csv`, `json`, `xml`, `parquet`, `zip` (anything else
+    returns an `unsupported_format` error). `num_rows` caps upstream row count;
+    `settings` is an optional passthrough dict of generation settings.
+    Returns the JSON envelope: on success `data.content` (csv/json/xml) or
+    `data.content_base64` (parquet/zip, base64-encoded — never decode these as
+    utf-8) plus `data.size_bytes`/`data.truncated`. On failure returns a
+    corrective error envelope (never raises)."""
+    if format not in _DATA_FORMATS:
+        return _err(
+            'unsupported_format',
+            f'format must be one of {sorted(_DATA_FORMATS)}; got {format!r}.',
+        )
     client = _client()
-    response = client.generate_data(fields, num_rows=num_rows, fmt=format, settings=settings)
-    if response.status_code >= 400:
-        try:
-            err = response.json()
-            return json.dumps({'error': err.get('error', response.text), 'status': response.status_code})
-        except Exception:
-            return json.dumps({'error': response.text, 'status': response.status_code})
-    content_type = response.headers.get('content-type', '')
-    if 'json' in content_type:
-        return response.text
-    return response.text[:50000]
-
-
-@mcp.tool()
-def list_field_types() -> str:
-    """List available field types grouped by category."""
-    return json.dumps(_client().list_field_types())
-
-
-@mcp.tool()
-def get_field_options(field_type: str) -> str:
-    """Get configuration schema for a field type."""
-    return json.dumps(_client().get_field_options(field_type))
-
-
-@mcp.tool()
-def propose_schema(prompt: str, locale: str = 'en_US') -> str:
-    """Propose a schema from natural language."""
-    return json.dumps(_client().propose_schema(prompt, locale=locale))
-
-
-@mcp.tool()
-def refine_schema(messages: list[dict], current_schema: dict) -> str:
-    """Refine an existing schema via conversation."""
-    return json.dumps(_client().refine_schema(messages, current_schema))
-
-
-@mcp.tool()
-def get_api_usage() -> str:
-    """Get current API key usage stats."""
-    return json.dumps(_client().get_usage())
-
-
-@mcp.tool()
-def list_projects() -> str:
-    """List user's Projects (Premium)."""
     try:
-        return json.dumps(_client().list_projects())
-    except Exception as exc:
-        return json.dumps({'error': str(exc)})
+        response = client.generate_data(fields, num_rows=num_rows, fmt=format, settings=settings)
+    except httpx.HTTPError as exc:
+        return _err('upstream_unavailable', f'Could not reach the Generate-Data.com API: {exc.__class__.__name__}. Retry later.', retriable=True)
+
+    if response.status_code >= 400:
+        try:
+            body = response.json()
+        except Exception:
+            body = None
+        return _err_from_status(response.status_code, body)
+
+    if format in _BINARY_FORMATS:
+        data = _encode_binary(format, response.content)
+    else:
+        data = _encode_text(format, response.text)
+    summary = f"Generated {num_rows} rows of {format.upper()} data ({data['size_bytes']:,} bytes)."
+    return _ok(summary, data)
 
 
 @mcp.tool()
-def generate_project(project_id: int, format: str = 'zip') -> str:
-    """Generate all tables in a Project. Returns ZIP bytes as text or JSON error."""
+def gd_list_field_types() -> str:
+    """List all available field types grouped by category. Use this to discover
+    valid `type` values before calling `gd_generate_dataset` or to look up which
+    category a field type belongs to. Takes no arguments. Returns the categorized
+    field-type catalog in `data.categories`."""
+    try:
+        result = _client().list_field_types()
+    except httpx.HTTPStatusError as exc:
+        return _err_from_http_status_error(exc)
+    except httpx.HTTPError as exc:
+        return _err('upstream_unavailable', f'Could not reach the Generate-Data.com API: {exc.__class__.__name__}. Retry later.', retriable=True)
+    categories = result.get('categories', {}) if isinstance(result, dict) else {}
+    return _ok(f'Found {len(categories)} field type categories.', result)
+
+
+@mcp.tool()
+def gd_get_field_type_options(field_type: str) -> str:
+    """Get the configuration option schema for one field type (e.g. what options
+    `email` or `date` accept). Use this before building a `fields` entry for
+    `gd_generate_dataset` that needs non-default options. `field_type` must match
+    `^[a-z0-9_]+$` (lowercase letters, digits, underscore only) — anything else
+    returns `invalid_input` without calling upstream. Returns the option schema
+    in `data`."""
+    try:
+        field_type = _validate_field_type(field_type)
+    except ValueError as exc:
+        return _err('invalid_input', str(exc))
+    try:
+        result = _client().get_field_options(field_type)
+    except httpx.HTTPStatusError as exc:
+        return _err_from_http_status_error(exc)
+    except httpx.HTTPError as exc:
+        return _err('upstream_unavailable', f'Could not reach the Generate-Data.com API: {exc.__class__.__name__}. Retry later.', retriable=True)
+    return _ok(f"Retrieved configuration options for field type '{field_type}'.", result)
+
+
+@mcp.tool()
+def gd_design_schema(
+    prompt: str,
+    locale: str = 'en_US',
+    messages: list[dict[str, Any]] | None = None,
+    current_schema: dict[str, Any] | None = None,
+) -> str:
+    """Design a dataset schema from natural language — one tool for both the
+    first proposal and follow-up refinements. Behavior branches on args:
+    - First call (propose): pass only `prompt` (and optionally `locale`, e.g.
+      'en_US', 'fr_FR'). `messages`/`current_schema` left unset.
+    - Refine call: pass BOTH `messages` (the running conversation, list of
+      `{"role": "user"|"assistant", "content": str}`) AND `current_schema` (the
+      schema object returned by the prior call) together — `prompt` is still
+      required by the signature but is not sent upstream for a refine call.
+      If only one of `messages`/`current_schema` is set, this falls back to
+      propose using `prompt`.
+    Returns the proposed/refined schema in `data` (upstream `proposed_schema`
+    shape), ready to hand to `gd_generate_dataset` as `fields`."""
     client = _client()
-    response = client.generate_project(project_id, fmt=format)
+    try:
+        if messages and current_schema:
+            result = client.refine_schema(messages, current_schema)
+            summary = 'Refined the schema based on the conversation.'
+        else:
+            result = client.propose_schema(prompt, locale=locale)
+            summary = f'Proposed a schema for: "{prompt}"'
+    except httpx.HTTPStatusError as exc:
+        return _err_from_http_status_error(exc)
+    except httpx.HTTPError as exc:
+        return _err('upstream_unavailable', f'Could not reach the Generate-Data.com API: {exc.__class__.__name__}. Retry later.', retriable=True)
+    return _ok(summary, result)
+
+
+@mcp.tool()
+def gd_get_usage() -> str:
+    """Get current API key usage stats (calls today, tier, limits). Use this to
+    check remaining quota or confirm which tier the configured API key has
+    before attempting a premium-only call. Takes no arguments. Returns the
+    usage stats in `data`."""
+    try:
+        result = _client().get_usage()
+    except httpx.HTTPStatusError as exc:
+        return _err_from_http_status_error(exc)
+    except httpx.HTTPError as exc:
+        return _err('upstream_unavailable', f'Could not reach the Generate-Data.com API: {exc.__class__.__name__}. Retry later.', retriable=True)
+    tier = result.get('tier', 'unknown') if isinstance(result, dict) else 'unknown'
+    calls = result.get('calls_today') if isinstance(result, dict) else None
+    summary = f'Current API tier: {tier}.' + (f' {calls} calls today.' if calls is not None else '')
+    return _ok(summary, result)
+
+
+# DOC: gd_list_projects/gd_generate_project are Premium-tier-only (contract
+# Sec. 1) — a valid but non-Premium GENERATE_DATA_API_KEY gets a `tier_forbidden`
+# error from upstream (403 + tier/premium/upgrade/plan keyword), classified by
+# _classify_http_error above; the agent should tell the user to upgrade their
+# Generate-Data.com plan rather than retry.
+@mcp.tool()
+def gd_list_projects(limit: int = 20, offset: int = 0) -> str:
+    """List the user's Projects (Premium tier only). Use this to discover
+    `project_id` values before calling `gd_generate_project`. `limit` (default
+    20, max 100) and `offset` (default 0) page through the results; results are
+    paginated client-side since the upstream API returns the full list.
+    Non-Premium API keys get a `tier_forbidden` error — upgrade the
+    Generate-Data.com plan to use this tool. Returns the page in `data`
+    (`items`, `limit`, `offset`, `total_count`, `has_more`, `next_offset`)."""
+    try:
+        limit, offset = _validate_pagination(limit, offset)
+    except ValueError as exc:
+        return _err('invalid_input', str(exc))
+    try:
+        items = _client().list_projects()
+    except httpx.HTTPStatusError as exc:
+        return _err_from_http_status_error(exc)
+    except httpx.HTTPError as exc:
+        return _err('upstream_unavailable', f'Could not reach the Generate-Data.com API: {exc.__class__.__name__}. Retry later.', retriable=True)
+    total_count = len(items)
+    page = items[offset:offset + limit]
+    data = _paginate(page, limit, offset, total_count=total_count)
+    return _ok(f'Found {total_count} project(s); returning {len(page)} starting at offset {offset}.', data)
+
+
+@mcp.tool()
+def gd_generate_project(project_id: int, format: str = 'zip') -> str:
+    """Generate all tables in a Project and download the result (Premium tier
+    only). `project_id` must be a positive integer (get one from
+    `gd_list_projects`). `format` must be one of `csv`, `json`, `xml`,
+    `parquet`, `zip` (default `zip`; anything else returns
+    `unsupported_format`). Non-Premium API keys get a `tier_forbidden` error —
+    upgrade the Generate-Data.com plan to use this tool. Returns the JSON
+    envelope: on success `data.content` (csv/json/xml) or
+    `data.content_base64` (parquet/zip, base64-encoded — never decode these as
+    utf-8) plus `data.size_bytes`/`data.truncated`. On failure returns a
+    corrective error envelope (never raises)."""
+    try:
+        project_id = _validate_project_id(project_id)
+    except ValueError as exc:
+        return _err('invalid_input', str(exc))
+    if format not in _DATA_FORMATS:
+        return _err(
+            'unsupported_format',
+            f'format must be one of {sorted(_DATA_FORMATS)}; got {format!r}.',
+        )
+    client = _client()
+    try:
+        response = client.generate_project(project_id, fmt=format)
+    except httpx.HTTPError as exc:
+        return _err('upstream_unavailable', f'Could not reach the Generate-Data.com API: {exc.__class__.__name__}. Retry later.', retriable=True)
+
     if response.status_code >= 400:
         try:
-            return json.dumps({'error': response.json().get('error', response.text), 'status': response.status_code})
+            body = response.json()
         except Exception:
-            return json.dumps({'error': response.text, 'status': response.status_code})
-    return response.content[:50000].decode('utf-8', errors='replace')
+            body = None
+        return _err_from_status(response.status_code, body)
+
+    if format in _BINARY_FORMATS:
+        data = _encode_binary(format, response.content)
+    else:
+        data = _encode_text(format, response.text)
+    summary = f"Generated project {project_id} as {format.upper()} ({data['size_bytes']:,} bytes)."
+    return _ok(summary, data)
 
 
 def main():
