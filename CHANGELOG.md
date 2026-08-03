@@ -5,6 +5,13 @@ All notable changes to `generate-data-mcp` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.1] - 2026-08-03
+
+Non-breaking. Adds an `mcp-name: io.github.ns-3e/generate-data-mcp` ownership-verification
+marker to the README (required by the official MCP Registry's PyPI-package verification —
+it checks for this string in the published package description). Restructures the README
+around a 30-second install flow. No code changes.
+
 ## [2.0.0] - 2026-08-03
 
 Full rebuild of the MCP server against Generate-Data.com `/api/v2/`. **Every tool

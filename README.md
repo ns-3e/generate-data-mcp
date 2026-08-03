@@ -1,5 +1,7 @@
 # generate-data-mcp
 
+<!-- mcp-name: io.github.ns-3e/generate-data-mcp -->
+
 [![PyPI](https://img.shields.io/pypi/v/generate-data-mcp)](https://pypi.org/project/generate-data-mcp/)
 
 An MCP server for [Generate-Data.com](https://generate-data.com) — generate synthetic datasets, design schemas from natural language, and manage Projects, straight from your agent.
