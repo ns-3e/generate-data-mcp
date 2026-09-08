@@ -20,3 +20,5 @@ venv/
 !.claude/program/channels/feature.md
 !.claude/program/schemas/
 node_modules/
+.claude/
+.cursor/
