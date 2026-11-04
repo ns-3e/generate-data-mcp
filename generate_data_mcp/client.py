@@ -114,10 +114,17 @@ class GenerateDataClient:
         base_url: Optional[str] = None,
         timeout: float = 60.0,
     ):
-        self.api_key = api_key or os.environ.get('GENERATE_DATA_API_KEY', '')
+        self.api_key = (api_key or os.environ.get('GENERATE_DATA_API_KEY', '')).strip()
         if not self.api_key:
             raise ConfigurationError(
                 'GENERATE_DATA_API_KEY is required. Set it in the MCP client config and restart the server.'
+            )
+        # httpx would fail on these before sending anything, as if the network had.
+        # The message must never include the key.
+        if not (self.api_key.isascii() and self.api_key.isprintable()) or any(c.isspace() for c in self.api_key):
+            raise ConfigurationError(
+                'GENERATE_DATA_API_KEY contains characters an API key cannot have. '
+                'Copy it again from Settings -> API Access and restart the server.'
             )
         self.base_url = _validated_base_url(
             base_url or os.environ.get('GENERATE_DATA_API_BASE_URL') or DEFAULT_BASE_URL
@@ -240,8 +247,10 @@ class GenerateDataClient:
 
     async def delete_project(self, project_id: int) -> None:
         response = await self._http.delete(self._url(f'/api/v2/projects/{project_id}'), headers=self._headers(), timeout=30)
-        # Success is 204 with no body, so there is nothing to parse.
         response.raise_for_status()
+        # The API answers 204. Any other 2xx (e.g. a proxy's page) hasn't deleted anything we know of.
+        if response.status_code != 204:
+            raise UnexpectedResponse(f'status {response.status_code} instead of confirming the deletion')
 
     async def propose_project(self, prompt: str) -> dict:
         return await self._post_json('/api/v2/ai/project/propose', {'prompt': prompt})

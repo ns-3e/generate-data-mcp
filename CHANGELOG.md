@@ -25,6 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A startup warning on stderr when `GENERATE_DATA_API_BASE_URL` sends the API key over
   plain `http://` to a non-loopback host.
 
+- **`data.warnings`** on generate results, from the API's `X-Generation-Warnings` header
+  and, for JSON, `meta.warnings`. The summary says so too, so a degraded result can't
+  read as clean.
+
 ### Changed
 
 - Read-only GET tools retry up to twice on connection failures, throttling and
@@ -35,6 +39,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `serverInfo.version` now reports this package's version, not the MCP SDK's.
 - Out-of-range `num_rows`, `limit`, `offset` and `project_id` are rejected before any
   API call, and relationship errors from the API now list the specific problems.
+- Booleans are rejected for every integer argument, so `project_id: true` no longer means
+  Project 1. Digit strings are still accepted.
+- An API key with surrounding whitespace is stripped. One that can't be sent is a
+  `configuration_error`.
+
+### Fixed
+
+- `gd_delete_project` only reports success on a 204, and `confirm` accepts only JSON `true`.
+- More bad 200 responses are reported as `upstream_error` rather than generated data:
+  ZIP-family files that don't open, broken JSON, truncated Parquet, and bodies that are
+  only an `{error: ...}` object.
+- A failed file write no longer leaves a partial file behind.
+
+### Security
+
+- The API key is redacted from upstream text if an upstream echoes it.
 
 ## [2.1.0] - 2026-11-04
 

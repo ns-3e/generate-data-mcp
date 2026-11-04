@@ -10,10 +10,12 @@ accept the formats in `_PROJECT_FORMATS`.
 import argparse
 import asyncio
 import functools
+import io
 import json
 import logging
 import os
 import sys
+import zipfile
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any, Awaitable, Callable, Literal, get_args
 
@@ -81,8 +83,14 @@ day, CSV datasets and ZIP Projects only. Pro: 10,000 rows, 50 columns, 20 tables
 calls a day, all formats. gd_get_usage shows the current plan and remaining calls.
 
 Small results come back inline. Larger ones are saved in full and returned as \
-data.file_path: read that file rather than generating again. Every failure is an error \
-envelope that says what to do next. Only retry when error.retriable is true.
+data.file_path: read that file rather than generating again. If data.warnings is \
+present, the data may be incomplete or have empty values, so read it before using the \
+result. Every failure is an error envelope that says what to do next. Only retry when \
+error.retriable is true.
+
+AI schema and Project design each use one daily call and are refused at the limit. Rows \
+for many-to-many relationships are limited to a budget set by the plan, so a junction \
+table can have fewer rows than the relationship could produce.
 """
 
 mcp = _GenerateDataServer('generate-data', instructions=_INSTRUCTIONS)
@@ -109,8 +117,13 @@ _DatasetFormatName = Literal['csv', 'json', 'xml', 'yaml', 'sql', 'jsonl', 'parq
 _ProjectFormatName = Literal['zip', 'xlsx', 'neo4j', 'jsonld', 'bundle']
 _DATASET_FORMATS = frozenset(get_args(_DatasetFormatName))
 _PROJECT_FORMATS = frozenset(get_args(_ProjectFormatName))
-_BINARY_MAGIC = {'parquet': b'PAR1'}  # the rest of BINARY_FORMATS are ZIP containers
-_ZIP_MAGIC = b'PK'
+_PARQUET_MAGIC = b'PAR1'  # the rest of BINARY_FORMATS are ZIP containers
+_JSON_FORMATS = frozenset({'json', 'jsonld', 'bundle'})
+_JSON_PARSE_LIMIT = 8 * 1024 * 1024
+_ERROR_BODY_LIMIT = 64 * 1024
+_ERROR_BODY_KEYS = frozenset({'error', 'code', 'details'})
+_WARNINGS_LIMIT = 20
+_WARNING_TEXT_LIMIT = 500
 
 _UPSTREAM_DETAIL_LIMIT = 2_000
 _UPSTREAM_MESSAGE_LIMIT = 500
@@ -123,11 +136,28 @@ def _lowercase(value: Any) -> Any:
 
 DatasetFormat = Annotated[_DatasetFormatName, BeforeValidator(_lowercase)]
 ProjectFormat = Annotated[_ProjectFormatName, BeforeValidator(_lowercase)]
-ProjectId = Annotated[int, Field(ge=1, description='A Project id from gd_list_projects.')]
-Limit = Annotated[int, Field(ge=1, le=100)]
-Offset = Annotated[int, Field(ge=0)]
+
+
+def _reject_bool(value: Any) -> Any:
+    # Pydantic would turn true into 1, which could address a real Project.
+    if isinstance(value, bool):
+        raise ValueError('must be an integer, not true or false')
+    return value
+
+
+# Digit strings stay accepted, because some MCP clients send numbers as strings.
+_Integer = Annotated[int, BeforeValidator(_reject_bool)]
+ProjectId = Annotated[int, Field(ge=1, description='A Project id from gd_list_projects.'), BeforeValidator(_reject_bool)]
+Limit = Annotated[int, Field(ge=1, le=100), BeforeValidator(_reject_bool)]
+Offset = Annotated[int, Field(ge=0), BeforeValidator(_reject_bool)]
 # No upper bound here: the cap depends on the plan and on any grant, so the API enforces it.
-NumRows = Annotated[int, Field(ge=1, description='Rows to generate. Capped by plan: 100 on Free, 10,000 on Pro.')]
+NumRows = Annotated[
+    int,
+    Field(ge=1, description='Rows to generate. Capped by plan: 100 on Free, 10,000 on Pro.'),
+    BeforeValidator(_reject_bool),
+]
+# Only JSON true confirms a deletion: lax parsing would accept "yes", "on", 1 and more.
+Confirm = Annotated[bool, Field(strict=True, description='Must be exactly true to delete.')]
 
 
 class GenerationSettings(BaseModel):
@@ -136,7 +166,7 @@ class GenerationSettings(BaseModel):
     model_config = ConfigDict(extra='allow')
 
     locale: str | None = Field(None, description='Locale requested for the data, as language_COUNTRY, e.g. en_US.')
-    seed: int | None = Field(None, description='Generate the same values again by reusing a seed.')
+    seed: _Integer | None = Field(None, description='Generate the same values again by reusing a seed.')
     include_header: bool | None = Field(None, description='Include a header row in CSV output. Default true.')
     line_ending: str | None = Field(None, description='CSV line endings: unix (default), windows or mac.')
     data_quality_level: str | None = Field(None, description='How clean the values are. Default clean.')
@@ -286,7 +316,22 @@ def _classify_http_error(status_code: int, body: Any, headers: Any = None) -> tu
     )
 
 
+def _redacted(value: Any) -> Any:
+    """`value` with the API key removed from every string, in case upstream echoes it."""
+    key = os.environ.get('GENERATE_DATA_API_KEY', '').strip()
+    if not key:
+        return value
+    if isinstance(value, str):
+        return value.replace(key, '[REDACTED]')
+    if isinstance(value, dict):
+        return {_redacted(k): _redacted(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redacted(item) for item in value]
+    return value
+
+
 def _err_from_status(status_code: int, body: Any, headers: Any = None) -> CallToolResult:
+    body = _redacted(body)
     code, message, retriable, details = _classify_http_error(status_code, body, headers)
     if body is not None:
         # Upstream text stays delimited as JSON and capped, never trusted.
@@ -370,20 +415,81 @@ def _tool(
     return register
 
 
-def _download_problem(fmt: str, response: httpx.Response) -> str | None:
-    """Why a 2xx body is not really the requested file, or None if it looks right.
-
-    A proxy or challenge page can answer 200 with HTML, and a redirect that is
-    not followed has an empty body; neither may be reported as generated data.
-    """
-    content = response.content
-    if not content:
-        return 'an empty response body'
-    if 'text/html' in response.headers.get('content-type', '').lower():
-        return 'an HTML page instead of data'
-    if fmt in BINARY_FORMATS and not content.startswith(_BINARY_MAGIC.get(fmt, _ZIP_MAGIC)):
-        return f'a body that is not a valid {fmt} file'
+def _error_only_text(parsed: Any) -> str | None:
+    """The error message if a parsed body is nothing but an error object."""
+    if isinstance(parsed, dict) and 'error' in parsed and parsed.keys() <= _ERROR_BODY_KEYS:
+        return str(parsed['error'])
     return None
+
+
+def _inspect_download(fmt: str, content: bytes, content_type: str) -> tuple[str | None, list[Any]]:
+    """Check a 2xx body really is the requested file. Returns (problem, warnings
+    embedded in the body). A proxy or challenge page can answer 200 with HTML, an
+    unfollowed redirect has an empty body, and an error object can arrive with a
+    200; none may be reported as generated data.
+
+    Stays cheap: a ZIP's central directory is read without decompressing anything,
+    and JSON too large to parse quickly only has its first byte checked.
+    """
+    if not content:
+        return 'an empty response body', []
+    if 'text/html' in content_type.lower():
+        return 'an HTML page instead of data', []
+    invalid = f'a body that is not a valid {fmt} file'
+    if fmt == 'parquet':
+        return (None if content.startswith(_PARQUET_MAGIC) and content.endswith(_PARQUET_MAGIC) else invalid), []
+    if fmt in BINARY_FORMATS:
+        try:
+            with zipfile.ZipFile(io.BytesIO(content)) as archive:
+                return (None if archive.infolist() else invalid), []
+        except zipfile.BadZipFile:
+            return invalid, []
+
+    if fmt in _JSON_FORMATS:
+        if len(content) > _JSON_PARSE_LIMIT:
+            return (None if content.lstrip()[:1] in (b'{', b'[') else invalid), []
+    elif not (content.lstrip()[:1] == b'{' and len(content) <= _ERROR_BODY_LIMIT):
+        return None, []
+    # One JSONL row with a single column named `error` is legitimate data.
+    elif fmt == 'jsonl' and 'json' not in content_type.lower().replace('x-ndjson', ''):
+        return None, []
+    try:
+        parsed = json.loads(content)
+    except ValueError:
+        return (invalid if fmt in _JSON_FORMATS else None), []
+    error_text = _error_only_text(parsed)
+    if error_text is not None:
+        return f'an error instead of data: {_quoted(_redacted(error_text))}', []
+    meta = parsed.get('meta') if isinstance(parsed, dict) else None
+    warnings = meta.get('warnings') if isinstance(meta, dict) else None
+    return None, warnings if fmt == 'json' and isinstance(warnings, list) else []
+
+
+def _warning_text(warning: Any) -> str:
+    if isinstance(warning, dict) and isinstance(warning.get('message'), str):
+        warning = warning['message']
+    text = warning if isinstance(warning, str) else json.dumps(warning, default=str)
+    return _redacted(text)[:_WARNING_TEXT_LIMIT]
+
+
+def _generation_warnings(response: httpx.Response, embedded: list[Any]) -> list[str]:
+    """Warnings from the X-Generation-Warnings header (a JSON array of strings)
+    and from the body. A header that can't be read still counts as a warning, so
+    a degraded result is never presented as clean."""
+    found: list[Any] = []
+    raw = response.headers.get('x-generation-warnings')
+    if raw is not None and raw.strip():
+        try:
+            parsed = json.loads(raw)
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, list):
+            found.extend(parsed)
+        else:
+            found.append('The API reported generation warnings in a form this server could not read.')
+    found.extend(embedded)
+    unique = list(dict.fromkeys(_warning_text(item) for item in found))
+    return unique[:_WARNINGS_LIMIT]
 
 
 def _usage_header(response: httpx.Response, name: str) -> int | None:
@@ -401,7 +507,10 @@ async def _render_download(fmt: str, response: httpx.Response, label: str, stem:
     """
     if response.status_code >= 300:
         return _err_from_status(response.status_code, _response_json(response), response.headers)
-    problem = _download_problem(fmt, response)
+    content = response.content
+    problem, embedded_warnings = await asyncio.to_thread(
+        _inspect_download, fmt, content, response.headers.get('content-type', ''),
+    )
     if problem:
         return _err(
             'upstream_error',
@@ -409,7 +518,6 @@ async def _render_download(fmt: str, response: httpx.Response, label: str, stem:
             details={'status': response.status_code},
         )
 
-    content = response.content
     binary = fmt in BINARY_FORMATS
     text = None if binary else response.text
     too_large = len(content) > INLINE_BINARY_LIMIT if binary else len(text) > INLINE_TEXT_LIMIT
@@ -436,6 +544,13 @@ async def _render_download(fmt: str, response: httpx.Response, label: str, stem:
         value = _usage_header(response, header)
         if value is not None:
             data[key] = value
+    warnings = _generation_warnings(response, embedded_warnings)
+    if warnings:
+        data['warnings'] = warnings
+        summary += (
+            f' WARNING: generation reported {len(warnings)} problem(s), so this data may be '
+            'incomplete or have empty values. Read data.warnings before using it.'
+        )
     return _ok(summary, data)
 
 
@@ -463,7 +578,8 @@ async def gd_generate_dataset(
     `save_to_file` is true, are saved in full and returned as `data.file_path`
     plus `data.preview` for text formats: read that file rather than regenerating.
     `data.rows` is the number of rows generated and `data.calls_remaining` the API
-    calls left today, when the API reports them. Failures return an error envelope
+    calls left today, when the API reports them. If `data.warnings` is present the
+    data may be incomplete or have empty values, so read it first. Failures return an error envelope
     saying what to do next; don't retry unless `error.retriable` is true."""
     fmt = format.lower()
     if fmt not in _DATASET_FORMATS:
@@ -577,7 +693,9 @@ async def gd_generate_project(project_id: ProjectId, format: ProjectFormat = 'zi
     must be a positive integer (get one from `gd_list_projects`). `format` is one
     of `zip` (default; one CSV per table), `xlsx`, `neo4j`, `jsonld`, `bundle`.
     Free keys can only use `zip` (others return `tier_forbidden`), and a project's
-    rows and columns must fit the plan's limits. Small results come back inline:
+    rows and columns must fit the plan's limits. Rows for many-to-many relationships
+    are limited to a plan budget, so a junction table can have fewer rows than the
+    relationship could produce. Small results come back inline:
     `data.content_base64` (`zip`, `xlsx`, `neo4j` — never decode these as utf-8)
     or `data.content` (`jsonld`, `bundle`). Results too large to return inline, or
     any result when `save_to_file` is true, are saved in full and returned as
@@ -611,7 +729,8 @@ async def gd_generate_project_inline(
     """Generate multi-table data once, without saving a Project. Takes the same
     `tables` and `relationships` as `gd_create_project`, or the `project` from
     `gd_design_project`, and returns results the same way as
-    `gd_generate_project`. Free keys can only use `zip`."""
+    `gd_generate_project`, including the budget on many-to-many rows. Free keys can
+    only use `zip`."""
     fmt = format.lower()
     if fmt not in _PROJECT_FORMATS:
         return _err(
@@ -667,9 +786,10 @@ async def gd_create_project(
     [fields], "primary_key_field": str (optional)}`, where fields are as in
     `gd_generate_dataset`. Each relationship is `{"from_table": parent, "to_table":
     child, "from_field": the foreign key column on the child, "to_field": the
-    parent's key, "cardinality": "one_to_many" (default)}`. Limits: Free 3 tables
-    and 100 total rows; Pro 20 tables and 10,000 total rows. Returns the Project,
-    with its new `id`, in `data`."""
+    parent's key, "cardinality": "one_to_many" (default)}`. Limits when saving: 3
+    tables on Free, 20 on Pro. Total rows are limited when generating, not here (100
+    on Free, 10,000 on Pro), so a saved Project can be too large to generate on the
+    current plan. Returns the Project, with its new `id`, in `data`."""
     project = await _client().create_project(_project_payload(name, tables, relationships, settings, domain_pack))
     if 'id' not in project:
         raise UnexpectedResponse('JSON without a Project id')
@@ -704,7 +824,7 @@ async def gd_update_project(
 
 
 @_tool('Delete Project', destructive=True, idempotent=True)
-async def gd_delete_project(project_id: ProjectId, confirm: bool = False) -> CallToolResult:
+async def gd_delete_project(project_id: ProjectId, confirm: Confirm = False) -> CallToolResult:
     """Permanently delete a saved Project and its tables. This cannot be undone,
     so only call it when the user has asked to delete this Project, and pass
     `confirm: true`. Without it, nothing is deleted and this returns
@@ -729,7 +849,8 @@ async def gd_design_project(prompt: str) -> CallToolResult:
     customers and orders". Nothing is saved. Returns `data.project` with `name`,
     `tables`, `relationships`, `settings` and `domain_pack`: pass those to
     `gd_generate_project_inline` for a one-off result or `gd_create_project` to
-    save it. Row counts in the proposal may exceed the current plan's limits."""
+    save it. Row counts in the proposal may exceed the current plan's limits. Each
+    call uses one daily API call and is refused once the daily limit is reached."""
     result = await _client().propose_project(prompt)
     project = result.get('project')
     if not isinstance(project, dict):
@@ -741,9 +862,7 @@ async def gd_design_project(prompt: str) -> CallToolResult:
 async def gd_validate_field_options(field_type: str, options: dict[str, Any]) -> CallToolResult:
     """Check whether `options` are valid for a field type, without generating
     anything. Invalid options are a normal result, not a failure: read
-    `data.is_valid` and `data.errors`. Generation can still reject options this
-    accepts, such as a minimum above a maximum. An unknown `field_type` returns
-    `not_found`."""
+    `data.is_valid` and `data.errors`. An unknown `field_type` returns `not_found`."""
     try:
         field_type = _validate_field_type(field_type)
     except ValueError as exc:

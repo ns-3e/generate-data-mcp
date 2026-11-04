@@ -6,7 +6,10 @@ Tools are async and return CallToolResult. `_call` runs one and returns its text
 with `.is_error` attached, so envelope assertions also check the MCP flag."""
 import asyncio
 import base64
+import io
 import json
+import os
+import zipfile
 from pathlib import Path
 
 import httpx
@@ -14,6 +17,7 @@ import pytest
 from unittest.mock import AsyncMock, patch
 
 from generate_data_mcp import server
+from generate_data_mcp._conventions import _save_output
 
 
 class _Text(str):
@@ -58,6 +62,13 @@ def _download(content: bytes, content_type: str = 'text/csv', status: int = 200,
     return httpx.Response(status, content=content, headers={'content-type': content_type, **(headers or {})})
 
 
+def _zip_bytes() -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, 'w') as archive:
+        archive.writestr('customers.csv', 'id\n1\n')
+    return buffer.getvalue()
+
+
 def _json_response(status: int, body: dict, headers: dict | None = None) -> httpx.Response:
     return httpx.Response(status, json=body, headers=headers)
 
@@ -100,7 +111,7 @@ def test_gd_generate_dataset_success_text():
 def test_gd_generate_dataset_binary_round_trip():
     """Regression for F-001/B-001: binary bytes must survive base64 round-trip
     unmangled, never force-decoded as utf-8."""
-    raw = b'PAR1\xff\xfe\x00\x01binary-payload\x80\x81\x82'
+    raw = b'PAR1\xff\xfe\x00\x01binary-payload\x80\x81\x82PAR1'
     mock_response = _download(raw, 'application/octet-stream')
 
     with patch('generate_data_mcp.server._client', return_value=AsyncMock()) as mock_client:
@@ -362,7 +373,7 @@ def test_gd_generate_project_success_text():
 
 def test_gd_generate_project_binary_round_trip():
     """Regression for F-001/B-001, project export path."""
-    raw = b'PK\x03\x04\xff\xfe\x00\x01project-zip-bytes\x80\x81\x82'
+    raw = _zip_bytes()
     mock_response = _download(raw, 'application/zip')
 
     with patch('generate_data_mcp.server._client', return_value=AsyncMock()) as mock_client:
@@ -649,7 +660,7 @@ def test_oversized_text_is_saved_whole_not_cut():
 
 
 def test_oversized_binary_is_saved_whole_without_a_preview():
-    body = b'PAR1' + b'\x00' * 100_000
+    body = b'PAR1' + b'\x00' * 100_000 + b'PAR1'
     data = _generate_ok(_download(body, 'application/octet-stream'), format='parquet')['data']
     assert Path(data['file_path']).read_bytes() == body
     assert data['encoding'] == 'binary'
@@ -686,7 +697,27 @@ def test_unwritable_output_dir_is_an_error_not_a_shorter_result(tmp_path, monkey
 
 def test_project_file_name_comes_from_the_id_not_the_arguments():
     with patch('generate_data_mcp.server._client', return_value=AsyncMock()) as mock_client:
-        mock_client.return_value.generate_project.return_value = _download(b'PK\x03\x04', 'application/zip')
+        mock_client.return_value.generate_project.return_value = _download(_zip_bytes(), 'application/zip')
         data = _assert_ok_envelope(gd_generate_project(project_id=7, save_to_file=True))['data']
     assert Path(data['file_path']).name.startswith('project-7-')
     assert Path(data['file_path']).suffix == '.zip'
+
+
+def test_save_writes_a_temporary_file_and_never_exposes_partial_content(tmp_path, monkeypatch):
+    monkeypatch.setenv('GENERATE_DATA_OUTPUT_DIR', str(tmp_path))
+    seen = {}
+    real_replace = os.replace
+
+    def replace(source, destination):
+        seen['source_content'] = Path(source).read_bytes()
+        seen['final_before_move'] = Path(destination).read_bytes()
+        seen['source_name'] = Path(source).name
+        real_replace(source, destination)
+
+    monkeypatch.setattr('generate_data_mcp._conventions.os.replace', replace)
+    path = _save_output('csv', 'dataset', b'id\n1\n')
+    assert seen['source_content'] == b'id\n1\n'
+    assert seen['final_before_move'] == b''
+    assert seen['source_name'].endswith('.part')
+    assert path.read_bytes() == b'id\n1\n'
+    assert [p.name for p in tmp_path.iterdir()] == [path.name]

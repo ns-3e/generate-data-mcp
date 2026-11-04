@@ -137,8 +137,10 @@ def _save_output(fmt: str, stem: str, content: bytes) -> Path:
     """Write `content` to a new file in the output directory and return its path.
 
     `stem` must come from server code, never from tool arguments, so callers
-    cannot influence where the file lands. Exclusive creation means an existing
-    file is never overwritten.
+    cannot influence where the file lands. Exclusive creation reserves the name,
+    so an existing file is never overwritten. The content goes to a temporary
+    file first and replaces only that reservation, so a failed write leaves
+    nothing behind.
     """
     directory = _output_dir()
     directory.mkdir(parents=True, exist_ok=True)
@@ -147,11 +149,20 @@ def _save_output(fmt: str, stem: str, content: bytes) -> Path:
     while True:
         path = directory / f'{stem}-{timestamp}-{secrets.token_hex(4)}.{extension}'
         try:
-            with open(path, 'xb') as handle:
-                handle.write(content)
+            open(path, 'xb').close()
         except FileExistsError:
             continue
-        return path.resolve()
+        break
+    temporary = path.with_name(f'.{path.name}.part')
+    try:
+        with open(temporary, 'xb') as handle:
+            handle.write(content)
+        os.replace(temporary, path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        path.unlink(missing_ok=True)
+        raise
+    return path.resolve()
 
 
 def _paginate(items: list, limit: int, offset: int, total_count: int) -> dict:

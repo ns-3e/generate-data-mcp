@@ -753,3 +753,202 @@ def test_plain_http_to_a_remote_host_warns_without_the_key():
 @pytest.mark.parametrize('base_url', ['https://example.test', 'http://localhost:8001', 'http://127.0.0.1:8001', 'http://[::1]:8001'])
 def test_no_http_warning_for_https_or_loopback(base_url):
     assert 'plain http://' not in _start_with_base_url(base_url).stderr
+
+
+# ---------------------------------------------------------------------------
+# Deleting needs a real confirmation and a real 204
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize('override', [
+    (200, b'<html>challenge</html>', 'text/html'),
+    (200, b'deleted', 'text/plain'),
+    (200, b'', 'text/plain'),
+    (202, {'queued': True}),
+], ids=['html', 'text', 'empty', 'accepted'])
+def test_delete_is_only_successful_on_204(api_url, override):
+    FakeApi.override = override
+    [result] = _call_tools(api_url, ('gd_delete_project', {'project_id': 7, 'confirm': True}))
+    assert result['ok'] is False
+    assert result['error']['code'] == 'upstream_error'
+
+
+@pytest.mark.parametrize('confirm', ['true', 'True', 'yes', 'on', 't', '1', 1, 1.0], ids=repr)
+def test_delete_confirm_accepts_only_json_true(api_url, confirm):
+    [result] = _call_tools(api_url, ('gd_delete_project', {'project_id': 7, 'confirm': confirm}))
+    assert result['error']['code'] == 'invalid_input'
+    assert FakeApi.requests == []
+
+
+def test_delete_with_boolean_project_id_leaves_project_1_alone(api_url):
+    [result] = _call_tools(api_url, ('gd_delete_project', {'project_id': True, 'confirm': True}))
+    assert result['error']['code'] == 'invalid_input'
+    assert FakeApi.requests == []
+
+
+@pytest.mark.parametrize('name,arguments', [
+    ('gd_generate_dataset', {'fields': FIELDS, 'num_rows': True}),
+    ('gd_generate_dataset', {'fields': FIELDS, 'settings': {'seed': True}}),
+    ('gd_generate_project', {'project_id': True}),
+    ('gd_get_project', {'project_id': True}),
+    ('gd_update_project', {'project_id': True, 'name': 'x'}),
+    ('gd_list_projects', {'limit': True}),
+    ('gd_list_projects', {'offset': False}),
+], ids=['num_rows', 'seed', 'generate-id', 'get-id', 'update-id', 'limit', 'offset'])
+def test_booleans_are_rejected_for_every_integer_argument(api_url, name, arguments):
+    [result] = _call_tools(api_url, (name, arguments))
+    assert result['error']['code'] == 'invalid_input'
+    assert FakeApi.requests == []
+
+
+def test_digit_strings_stay_accepted_for_integers(api_url):
+    project, listed = _call_tools(
+        api_url,
+        ('gd_get_project', {'project_id': '7'}),
+        ('gd_list_projects', {'limit': '5'}),
+    )
+    assert project['data']['id'] == 7
+    assert listed['data']['limit'] == 5
+
+
+# ---------------------------------------------------------------------------
+# Generation warnings
+# ---------------------------------------------------------------------------
+
+CSV_OK = b'id\n1\n'
+
+
+@pytest.mark.parametrize('header,expected', [
+    ('["AI provider unavailable"]', ['AI provider unavailable']),
+    ('not json', ['The API reported generation warnings in a form this server could not read.']),
+    ('{"a": 1}', ['The API reported generation warnings in a form this server could not read.']),
+], ids=['array', 'malformed', 'wrong-shape'])
+def test_generation_warnings_header_is_surfaced(api_url, header, expected):
+    FakeApi.override = (200, CSV_OK, 'text/csv', {'X-Generation-Warnings': header})
+    [result] = _call_tools(api_url, ('gd_generate_dataset', {'fields': FIELDS}))
+    assert result['ok'] is True
+    assert result['data']['warnings'] == expected
+    assert 'WARNING' in result['summary'] and 'data.warnings' in result['summary']
+
+
+def test_empty_warnings_header_reads_as_clean(api_url):
+    FakeApi.override = (200, CSV_OK, 'text/csv', {'X-Generation-Warnings': '[]'})
+    [result] = _call_tools(api_url, ('gd_generate_dataset', {'fields': FIELDS}))
+    assert 'warnings' not in result['data']
+    assert 'WARNING' not in result['summary']
+
+
+def test_json_meta_warnings_are_surfaced_and_deduplicated(api_url):
+    body = {'records': [{'id': 1, 'note': ''}], 'meta': {'warnings': [{'code': 'x', 'message': 'no provider'}, 'other']}}
+    FakeApi.override = (200, body, 'application/json', {'X-Generation-Warnings': '["no provider"]'})
+    [result] = _call_tools(api_url, ('gd_generate_dataset', {'fields': FIELDS, 'format': 'json'}))
+    assert result['data']['warnings'] == ['no provider', 'other']
+    assert 'WARNING' in result['summary']
+
+
+# ---------------------------------------------------------------------------
+# Bodies that say 200 but aren't the file
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize('name,arguments,body,content_type', [
+    ('gd_generate_project', {'project_id': 7}, b'PK garbage', 'application/zip'),
+    ('gd_generate_project', {'project_id': 7, 'format': 'neo4j'}, b'PK garbage', 'application/zip'),
+    ('gd_generate_project', {'project_id': 7, 'format': 'jsonld'}, b'not json', 'application/json'),
+    ('gd_generate_project', {'project_id': 7, 'format': 'bundle'}, {'error': 'x'}, 'application/json'),
+    ('gd_generate_dataset', {'fields': FIELDS, 'format': 'csv'}, {'error': 'x', 'code': 'y'}, 'application/json'),
+    ('gd_generate_dataset', {'fields': FIELDS, 'format': 'json'}, b'{broken', 'application/json'),
+    ('gd_generate_dataset', {'fields': FIELDS, 'format': 'parquet'}, b'PAR1 truncated', 'application/octet-stream'),
+], ids=['zip', 'neo4j', 'jsonld', 'bundle-error', 'csv-error', 'json-broken', 'parquet-truncated'])
+def test_bad_200_bodies_are_failures(api_url, name, arguments, body, content_type):
+    FakeApi.override = (200, body, content_type)
+    [result] = _call_tools(api_url, (name, arguments))
+    assert result['ok'] is False
+    assert result['error']['code'] == 'upstream_error'
+
+
+def test_jsonl_row_with_a_column_named_error_is_data(api_url):
+    FakeApi.override = (200, b'{"error": "row value"}\n', 'application/x-ndjson')
+    [result] = _call_tools(api_url, ('gd_generate_dataset', {'fields': FIELDS, 'format': 'jsonl'}))
+    assert result['ok'] is True
+
+
+def test_json_body_with_records_and_an_error_column_is_data(api_url):
+    FakeApi.override = (200, {'records': [{'error': 'x'}]}, 'application/json')
+    [result] = _call_tools(api_url, ('gd_generate_dataset', {'fields': FIELDS, 'format': 'json'}))
+    assert result['ok'] is True
+
+
+# ---------------------------------------------------------------------------
+# Unusable keys and key redaction
+# ---------------------------------------------------------------------------
+
+def test_key_surrounded_by_whitespace_is_stripped(api_url):
+    [result] = _call_tools(api_url, ('gd_get_usage', {}), key=f'  {API_KEY}\n')
+    assert result['ok'] is True
+    assert FakeApi.requests[-1][3]['X-API-Key'] == API_KEY
+
+
+@pytest.mark.parametrize('key', ['bad key-value', 'bad\nkey-value', 'clé-secrète', '   '], ids=['space', 'newline', 'non-ascii', 'blank'])
+def test_unusable_key_is_configuration_error_and_never_printed(api_url, key):
+    [result] = _call_tools(api_url, ('gd_get_usage', {}), key=key)
+    assert result['error']['code'] == 'configuration_error'
+    assert result['error']['retriable'] is False
+    assert FakeApi.requests == []
+    if key.strip():
+        assert key not in json.dumps(result, ensure_ascii=False)
+
+
+@pytest.mark.parametrize('name,arguments', [
+    ('gd_get_usage', {}),
+    ('gd_generate_dataset', {'fields': FIELDS}),
+])
+def test_echoed_key_is_redacted_everywhere(api_url, name, arguments):
+    FakeApi.override = (400, {'error': f'Bad key {API_KEY}', 'details': [f'got {API_KEY}']})
+    [result] = _call_tools(api_url, (name, arguments))
+    assert API_KEY not in json.dumps(result)
+    assert '[REDACTED]' in result['error']['details']['upstream']
+
+
+def test_key_echoed_in_a_200_error_or_warning_is_redacted(api_url):
+    FakeApi.sequence = [
+        (200, {'error': f'Bad key {API_KEY}'}, 'application/json'),
+        (200, CSV_OK, 'text/csv', {'X-Generation-Warnings': json.dumps([f'used {API_KEY}'])}),
+    ]
+    results = _call_tools(
+        api_url,
+        ('gd_generate_dataset', {'fields': FIELDS}),
+        ('gd_generate_dataset', {'fields': FIELDS}),
+    )
+    assert API_KEY not in json.dumps(results)
+    assert results[1]['data']['warnings'] == ['used [REDACTED]']
+
+
+# ---------------------------------------------------------------------------
+# Failed writes leave nothing behind
+# ---------------------------------------------------------------------------
+
+def test_failed_write_leaves_no_partial_file(api_url, output_dir):
+    """`ulimit -f` makes the real write fail part-way, inside the real server."""
+    output_dir.mkdir()
+    params = StdioServerParameters(
+        command='/bin/sh',
+        args=['-c', f'ulimit -f 8; exec "{sys.executable}" -m generate_data_mcp.server'],
+        env={**_server_params(api_url).env, 'PYTHONDONTWRITEBYTECODE': '1'},
+    )
+
+    async def run():
+        async with stdio_client(params) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                result = await session.call_tool('gd_generate_dataset', {'fields': FIELDS, 'num_rows': 40_000})
+                return json.loads(result.content[0].text)
+
+    result = asyncio.run(run())
+    assert result['error']['code'] == 'configuration_error'
+    assert list(output_dir.iterdir()) == []
+
+
+def test_saved_file_is_complete_with_no_temporary_left(api_url, output_dir):
+    [result] = _call_tools(api_url, ('gd_generate_dataset', {'fields': FIELDS, 'num_rows': 3, 'save_to_file': True}))
+    files = list(output_dir.iterdir())
+    assert [str(p) for p in files] == [result['data']['file_path']]
+    assert files[0].read_text() == 'id\n1\n2\n3\n'
