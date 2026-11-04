@@ -7,7 +7,7 @@ description: >-
   MCP server for Generate-Data.com — generate synthetic datasets from a field
   schema, design schemas from natural language, discover field types, check
   API usage, and list/generate multi-table Projects.
-image: ns-3e/generate-data-mcp:2.0.2
+image: ns-3e/generate-data-mcp:2.1.0
 type: server
 source:
   project: https://github.com/ns-3e/generate-data-mcp
@@ -38,3 +38,8 @@ config:
     required: false
     default: https://generate-data.com
     description: Override the Generate-Data.com API base URL (e.g. for local development).
+  - name: GENERATE_DATA_OUTPUT_DIR
+    env: GENERATE_DATA_OUTPUT_DIR
+    required: false
+    default: ~/generate-data-output
+    description: Directory for results too large to return inline. Mount a volume to read them from outside the container.

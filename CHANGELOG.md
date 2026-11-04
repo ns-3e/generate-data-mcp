@@ -5,6 +5,53 @@ All notable changes to `generate-data-mcp` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.0] - 2026-11-04
+
+### Changed — behavior to check if you parse results
+
+- **Failed calls now report `isError: true`.** The JSON envelope in the text content
+  is unchanged. Clients that treat `isError` as a failure now see these calls as
+  failures; agents reading `ok` see no difference.
+- **Large results are saved to a file instead of being cut.** Text over 50,000
+  characters and binary over 32 KiB are written in full to `GENERATE_DATA_OUTPUT_DIR`
+  (default `~/generate-data-output`) and returned as `data.file_path`, with
+  `data.preview` for text. `data.content` and `data.content_base64` are absent in that
+  case, and binary results over 32 KiB are no longer returned inline at all. Files are
+  never overwritten and are not deleted automatically. `truncated` is now always false.
+- **Dataset summaries report rows actually generated,** from the API, and `data.rows`
+  carries the number. Without that figure the summary makes no row claim.
+- **`structuredContent` is no longer sent,** and tools no longer declare an
+  `outputSchema`. It held a second copy of the payload as a JSON string. Read the text
+  content.
+- **Errors changed:**
+  - New code `configuration_error`: missing key, unusable or unresolvable
+    `GENERATE_DATA_API_BASE_URL`, or an unwritable output directory. Not retriable.
+  - The daily call limit is `rate_limited` with `retriable: false` and
+    `details.resets_at`.
+  - Per-minute limits and 502/503/504 are retriable, with `details.retry_after` when
+    known.
+  - `max_rows`, `max_columns`, `max_tables`, `format_not_allowed` and `ai_not_entitled`
+    are `tier_forbidden`.
+  - 422 is `invalid_input`. A 500 no longer suggests retrying.
+  - The API's own message, quoted, now appears in `error.message`, and
+    `details.upstream` is capped at 2,000 characters.
+
+### Added
+
+- `save_to_file` on `gd_generate_dataset` and `gd_generate_project` to save a result of
+  any size.
+
+### Fixed
+
+- **Every failure now uses the envelope.** Invalid arguments, unknown tools, a missing
+  API key, non-JSON or wrongly shaped API responses and unexpected exceptions used to
+  surface as raw text such as `slice(0, 20, None)`.
+- A `field_type` with a trailing newline is rejected instead of raising a URL error.
+- Tool calls no longer block the server: parallel calls run concurrently, and pings are
+  answered during a slow call.
+- Wrongly shaped responses on `gd_list_field_types`, `gd_get_usage` and
+  `gd_design_schema` are errors, not success with `unknown` values.
+
 ## [2.0.2] - 2026-11-04
 
 ### Fixed
@@ -121,6 +168,7 @@ upstream list.
   `^[a-z0-9_]+$`, `project_id` must be a positive integer, `limit`/`offset` are
   range-checked.
 
+[2.1.0]: https://github.com/ns-3e/generate-data-mcp/releases/tag/v2.1.0
 [2.0.2]: https://github.com/ns-3e/generate-data-mcp/releases/tag/v2.0.2
 [2.0.1]: https://github.com/ns-3e/generate-data-mcp/releases/tag/v2.0.1
 [2.0.0]: https://github.com/ns-3e/generate-data-mcp/releases/tag/v2.0.0

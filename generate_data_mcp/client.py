@@ -1,20 +1,44 @@
-"""HTTP client for Generate-Data.com API v2.
+"""Async HTTP client for Generate-Data.com API v2.
 
-DOC: owns one module-reused httpx.Client per GenerateDataClient instance
-(contract Sec. 8 / brief F-008) instead of a fresh connection per call.
-Server construction (F-002/F-003) MUST instantiate GenerateDataClient once
-per process and reuse it across tool calls — never build a new client per
-call. Closing on interpreter exit is skipped (stdio process lifetime).
+One GenerateDataClient, with one reused httpx.AsyncClient, serves the whole
+server process. The server creates it on the first tool call, so its connection
+pool belongs to the event loop that runs the tools.
 """
 import os
 from typing import Any, Optional
+from urllib.parse import urlsplit
 
 import httpx
 
+from generate_data_mcp._conventions import BINARY_FORMATS
+
 DEFAULT_BASE_URL = 'https://generate-data.com'
 
-# Formats the API returns as binary bodies. `hf-datasets` and `neo4j` are ZIPs.
-_BINARY_FORMATS = frozenset({'parquet', 'xlsx', 'hf-datasets', 'zip', 'neo4j'})
+
+class ConfigurationError(ValueError):
+    """The server's environment is wrong; retrying cannot help."""
+
+
+class UnexpectedResponse(Exception):
+    """A 2xx response whose body is not what this API returns."""
+
+
+def _validated_base_url(raw: str) -> str:
+    base_url = raw.rstrip('/')
+    problem = 'must be an http(s) URL such as https://generate-data.com'
+    try:
+        parts = urlsplit(base_url)
+        valid = parts.scheme in ('http', 'https') and bool(parts.hostname)
+    except ValueError:
+        valid = False
+    if not valid:
+        raise ConfigurationError(f'GENERATE_DATA_API_BASE_URL {problem}.')
+    if '/api' in parts.path:
+        raise ConfigurationError(
+            'GENERATE_DATA_API_BASE_URL must be the site origin without a path: '
+            'remove /api/v2, which is added automatically.'
+        )
+    return base_url
 
 
 class GenerateDataClient:
@@ -25,27 +49,49 @@ class GenerateDataClient:
         timeout: float = 60.0,
     ):
         self.api_key = api_key or os.environ.get('GENERATE_DATA_API_KEY', '')
-        self.base_url = (base_url or os.environ.get('GENERATE_DATA_API_BASE_URL') or DEFAULT_BASE_URL).rstrip('/')
-        self.timeout = timeout
         if not self.api_key:
-            raise ValueError('GENERATE_DATA_API_KEY is required')
-        # DOC: single reused connection pool for the lifetime of this client
-        # instance; avoids a new TCP/TLS handshake (and fd) per tool call.
-        self._http = httpx.Client(timeout=timeout)
+            raise ConfigurationError(
+                'GENERATE_DATA_API_KEY is required. Set it in the MCP client config and restart the server.'
+            )
+        self.base_url = _validated_base_url(
+            base_url or os.environ.get('GENERATE_DATA_API_BASE_URL') or DEFAULT_BASE_URL
+        )
+        self.timeout = timeout
+        self._http = httpx.AsyncClient(timeout=timeout)
 
     def _headers(self, accept: str = 'application/json') -> dict[str, str]:
-        # DOC: binary-format generate calls (parquet/zip) pass Accept: */*
-        # so an upstream that honors Accept doesn't coerce a binary body to
-        # JSON; all other calls keep application/json.
+        # Binary downloads pass Accept: */* so an upstream that honors Accept
+        # doesn't coerce the body to JSON.
         return {'X-API-Key': self.api_key, 'Accept': accept}
 
     def _url(self, path: str) -> str:
         return f'{self.base_url}{path}'
 
-    def close(self) -> None:
-        self._http.close()
+    async def close(self) -> None:
+        await self._http.aclose()
 
-    def generate_data(
+    @staticmethod
+    def _parse(response: httpx.Response, expected: type) -> Any:
+        """Raise HTTPStatusError for non-2xx, UnexpectedResponse for a body that
+        is not the JSON type this endpoint returns (e.g. a proxy's HTML page)."""
+        response.raise_for_status()
+        try:
+            body = response.json()
+        except ValueError as exc:
+            raise UnexpectedResponse('a body that is not JSON') from exc
+        if not isinstance(body, expected):
+            raise UnexpectedResponse(f'JSON of an unexpected shape ({type(body).__name__})')
+        return body
+
+    async def _get_json(self, path: str, expected: type = dict) -> Any:
+        response = await self._http.get(self._url(path), headers=self._headers(), timeout=30)
+        return self._parse(response, expected)
+
+    async def _post_json(self, path: str, payload: dict, expected: type = dict) -> Any:
+        response = await self._http.post(self._url(path), json=payload, headers=self._headers(), timeout=60)
+        return self._parse(response, expected)
+
+    async def generate_data(
         self,
         fields: list[dict],
         num_rows: int = 100,
@@ -59,60 +105,34 @@ class GenerateDataClient:
         }
         if settings:
             payload['settings'] = settings
-        accept = '*/*' if fmt in _BINARY_FORMATS else 'application/json'
-        return self._http.post(
+        accept = '*/*' if fmt in BINARY_FORMATS else 'application/json'
+        return await self._http.post(
             self._url('/api/v2/generate'),
             json=payload,
             headers=self._headers(accept=accept),
         )
 
-    def list_field_types(self) -> dict:
-        r = self._http.get(self._url('/api/v2/field-types'), headers=self._headers(), timeout=30)
-        r.raise_for_status()
-        return r.json()
+    async def list_field_types(self) -> dict:
+        return await self._get_json('/api/v2/field-types')
 
-    def get_field_options(self, field_type: str) -> dict:
-        r = self._http.get(
-            self._url(f'/api/v2/field-types/{field_type}/options'),
-            headers=self._headers(),
-            timeout=30,
-        )
-        r.raise_for_status()
-        return r.json()
+    async def get_field_options(self, field_type: str) -> dict:
+        return await self._get_json(f'/api/v2/field-types/{field_type}/options')
 
-    def propose_schema(self, prompt: str, locale: str = 'en_US') -> dict:
-        r = self._http.post(
-            self._url('/api/v2/ai/schema/propose'),
-            json={'prompt': prompt, 'locale': locale},
-            headers=self._headers(),
-            timeout=60,
-        )
-        r.raise_for_status()
-        return r.json()
+    async def propose_schema(self, prompt: str, locale: str = 'en_US') -> dict:
+        return await self._post_json('/api/v2/ai/schema/propose', {'prompt': prompt, 'locale': locale})
 
-    def refine_schema(self, messages: list[dict], schema: list[dict]) -> dict:
-        r = self._http.post(
-            self._url('/api/v2/ai/schema/refine'),
-            json={'messages': messages, 'schema': schema},
-            headers=self._headers(),
-            timeout=60,
-        )
-        r.raise_for_status()
-        return r.json()
+    async def refine_schema(self, messages: list[dict], schema: list[dict]) -> dict:
+        return await self._post_json('/api/v2/ai/schema/refine', {'messages': messages, 'schema': schema})
 
-    def get_usage(self) -> dict:
-        r = self._http.get(self._url('/api/v2/api-keys/usage'), headers=self._headers(), timeout=30)
-        r.raise_for_status()
-        return r.json()
+    async def get_usage(self) -> dict:
+        return await self._get_json('/api/v2/api-keys/usage')
 
-    def list_projects(self) -> list:
-        r = self._http.get(self._url('/api/v2/projects'), headers=self._headers(), timeout=30)
-        r.raise_for_status()
-        return r.json()
+    async def list_projects(self) -> list:
+        return await self._get_json('/api/v2/projects', expected=list)
 
-    def generate_project(self, project_id: int, fmt: str = 'zip') -> httpx.Response:
-        accept = '*/*' if fmt in _BINARY_FORMATS else 'application/json'
-        return self._http.post(
+    async def generate_project(self, project_id: int, fmt: str = 'zip') -> httpx.Response:
+        accept = '*/*' if fmt in BINARY_FORMATS else 'application/json'
+        return await self._http.post(
             self._url(f'/api/v2/projects/{project_id}/generate'),
             # Must be in the body: DRF reserves `?format=` for renderer selection
             # and answers 404 for any value it has no renderer for (e.g. zip).

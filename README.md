@@ -89,7 +89,13 @@ A typical session looks like this — the agent chains tools on its own, you jus
 3. **Generate the data.** `gd_generate_dataset(fields=..., num_rows=10, format="csv")` — returns the rows.
 4. **Refine if needed.** Call `gd_design_schema` again, this time passing `messages` (the running conversation) + `current_schema` (the prior `proposed_schema` array) together — it refines instead of proposing fresh.
 
-Every tool returns the same envelope: `{"ok": true, "summary": "...", "data": {...}}` on success, or `{"ok": false, "error": {"code": ..., "message": ...}}` on failure — errors always tell you what to do next, never a raw stack trace.
+Every tool returns the same envelope: `{"ok": true, "summary": "...", "data": {...}}` on success, or `{"ok": false, "error": {"code": ..., "message": ..., "retriable": ..., "details": {...}}}` on failure, with MCP's `isError` set to true. Errors always tell you what to do next, never a raw stack trace.
+
+### Large results
+
+Small results come back inline. Text over 50,000 characters and binary over 32 KiB are saved in full to a new file and returned as `data.file_path`, with `data.preview` for text formats. Pass `save_to_file: true` to save a result of any size.
+
+Files go to `GENERATE_DATA_OUTPUT_DIR` (default `~/generate-data-output`). They're never overwritten and never deleted automatically, so clear the directory yourself when you're done. In the Docker image, that path is inside the container: mount a volume there and set `GENERATE_DATA_OUTPUT_DIR` to read the files from outside.
 
 ### Local development
 
@@ -146,15 +152,32 @@ Limits are enforced by the Django API, not this MCP server.
 |----------|----------|---------|
 | `GENERATE_DATA_API_KEY` | Yes | — |
 | `GENERATE_DATA_API_BASE_URL` | No | `https://generate-data.com` |
+| `GENERATE_DATA_OUTPUT_DIR` | No | `~/generate-data-output` |
+
+## Error codes
+
+| `error.code` | Meaning | `retriable` |
+|--------------|---------|-------------|
+| `invalid_input` | Bad arguments, or the API rejected the request; `message` says why | No |
+| `auth_failed` | Invalid or deactivated API key | No |
+| `tier_forbidden` | The plan doesn't allow this format or size | No |
+| `rate_limited` | Per-minute limit (`details.retry_after`) or daily limit (`details.resets_at`) | Per-minute yes, daily no |
+| `not_found` | Unknown project id or field type | No |
+| `unsupported_format` | Format isn't offered by this tool | No |
+| `configuration_error` | Missing key, unusable base URL, or unwritable output directory | No |
+| `upstream_unavailable` | Connection failure, timeout, or 502/503/504 | Yes |
+| `upstream_error` | Unexpected API response | No |
 
 ## Troubleshooting
 
 | Symptom | Fix |
 |---------|-----|
-| `GENERATE_DATA_API_KEY is required` | Set env var before starting the server |
-| HTTP 401 / `auth_failed` | Invalid or deactivated key |
-| HTTP 429 / `rate_limited` | Per-minute or daily cap hit; wait or upgrade tier |
-| HTTP 403 / `tier_forbidden` | Free tier lacks access; upgrade plan |
+| `configuration_error` naming `GENERATE_DATA_API_KEY` | Set the variable in your MCP client config and restart the server |
+| `configuration_error` naming `GENERATE_DATA_API_BASE_URL` | Use the site origin, such as `https://generate-data.com`, without `/api/v2` |
+| `configuration_error` naming `GENERATE_DATA_OUTPUT_DIR` | Point it at a writable directory |
+| `auth_failed` | Invalid or deactivated key |
+| `rate_limited` | Wait for `details.retry_after` seconds, or until `details.resets_at` for the daily limit, or upgrade |
+| `tier_forbidden` | Reduce the request to fit your plan, or upgrade |
 | `unsupported_format` | Use a format listed for that tool: datasets and Projects support different formats |
 | `invalid_input` on a field type or project ID | Value failed server-side validation before any request was sent — check spelling/type |
 

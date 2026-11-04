@@ -3,6 +3,7 @@
 Skipped unless GENERATE_DATA_SMOKE_API_KEY is set. Uses a few API calls of that
 key's daily quota and creates nothing.
 """
+import asyncio
 import json
 import os
 
@@ -22,13 +23,18 @@ def _live_client(monkeypatch):
     monkeypatch.setattr(server, '_client_singleton', None)
 
 
+def _envelope(tool, **kwargs) -> dict:
+    return json.loads(asyncio.run(tool(**kwargs)).content[0].text)
+
+
 def test_usage_and_field_types():
-    assert json.loads(server.gd_get_usage())['ok'] is True
-    assert json.loads(server.gd_list_field_types())['data']['categories']
+    assert _envelope(server.gd_get_usage)['ok'] is True
+    server._client_singleton = None  # its connection pool belongs to the last loop
+    assert _envelope(server.gd_list_field_types)['data']['categories']
 
 
 def test_generate_dataset_returns_requested_columns():
     fields = [{'name': 'id', 'type': 'row_number', 'options': {}}]
-    result = json.loads(server.gd_generate_dataset(fields=fields, num_rows=2))
+    result = _envelope(server.gd_generate_dataset, fields=fields, num_rows=2)
     assert result['ok'] is True, result
     assert result['data']['content'].startswith('id')

@@ -7,12 +7,12 @@
     "url": "https://github.com/ns-3e/generate-data-mcp",
     "source": "github"
   },
-  "version": "2.0.2",
+  "version": "2.1.0",
   "packages": [
     {
       "registryType": "pypi",
       "identifier": "generate-data-mcp",
-      "version": "2.0.2",
+      "version": "2.1.0",
       "transport": {
         "type": "stdio"
       },
@@ -22,6 +22,13 @@
           "description": "Generate-Data.com API key (Settings -> API Access). Required.",
           "isRequired": true,
           "isSecret": true,
+          "format": "string"
+        },
+        {
+          "name": "GENERATE_DATA_OUTPUT_DIR",
+          "description": "Directory for results too large to return inline (defaults to ~/generate-data-output).",
+          "isRequired": false,
+          "isSecret": false,
           "format": "string"
         },
         {

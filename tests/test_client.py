@@ -1,11 +1,12 @@
 """Tests for GenerateDataClient (HTTP layer, mocked at the instance's reused
-httpx.Client — `client._http` — per contract Sec. 8 / brief F-008, not the old
-module-level httpx.get/post pattern)."""
+httpx.AsyncClient, `client._http`)."""
+import asyncio
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
 
-from generate_data_mcp.client import GenerateDataClient
+from generate_data_mcp.client import ConfigurationError, GenerateDataClient, UnexpectedResponse
 
 
 @pytest.fixture
@@ -25,9 +26,8 @@ def test_default_base_url_is_a_routed_host():
 
 
 def test_client_reuses_one_httpx_client(client):
-    """brief F-008: one reused httpx.Client per GenerateDataClient instance."""
-    import httpx
-    assert isinstance(client._http, httpx.Client)
+    """One reused httpx.AsyncClient per GenerateDataClient instance."""
+    assert isinstance(client._http, httpx.AsyncClient)
 
 
 def test_generate_data_posts_to_v2(client):
@@ -37,7 +37,7 @@ def test_generate_data_posts_to_v2(client):
     mock_response.headers = {'content-type': 'text/csv'}
 
     with patch.object(client._http, 'post', return_value=mock_response) as post:
-        resp = client.generate_data([{'name': 'first_name', 'type': 'first_name', 'options': {}}], num_rows=5)
+        resp = asyncio.run(client.generate_data([{'name': 'first_name', 'type': 'first_name', 'options': {}}], num_rows=5))
 
     post.assert_called_once()
     args, kwargs = post.call_args
@@ -53,7 +53,7 @@ def test_list_field_types(client):
     mock_response.json.return_value = {'categories': {}}
 
     with patch.object(client._http, 'get', return_value=mock_response) as get:
-        data = client.list_field_types()
+        data = asyncio.run(client.list_field_types())
 
     get.assert_called_once_with(
         'http://test/api/v2/field-types',
@@ -69,7 +69,7 @@ def test_get_field_options(client):
     mock_response.json.return_value = {'options': []}
 
     with patch.object(client._http, 'get', return_value=mock_response) as get:
-        data = client.get_field_options('email')
+        data = asyncio.run(client.get_field_options('email'))
 
     get.assert_called_once_with(
         'http://test/api/v2/field-types/email/options',
@@ -85,7 +85,7 @@ def test_propose_schema(client):
     mock_response.json.return_value = {'proposed_schema': []}
 
     with patch.object(client._http, 'post', return_value=mock_response) as post:
-        data = client.propose_schema('customers with email')
+        data = asyncio.run(client.propose_schema('customers with email'))
 
     post.assert_called_once()
     assert post.call_args[1]['json']['prompt'] == 'customers with email'
@@ -100,7 +100,7 @@ def test_refine_schema(client):
     messages = [{'role': 'user', 'content': 'add VAT field'}]
     schema = [{'name': 'id', 'type': 'row_number', 'options': {}}]
     with patch.object(client._http, 'post', return_value=mock_response) as post:
-        data = client.refine_schema(messages, schema)
+        data = asyncio.run(client.refine_schema(messages, schema))
 
     post.assert_called_once()
     body = post.call_args[1]['json']
@@ -116,7 +116,7 @@ def test_get_usage(client):
     mock_response.json.return_value = {'calls_today': 3, 'tier': 'FREE'}
 
     with patch.object(client._http, 'get', return_value=mock_response) as get:
-        data = client.get_usage()
+        data = asyncio.run(client.get_usage())
 
     get.assert_called_once_with(
         'http://test/api/v2/api-keys/usage',
@@ -132,7 +132,7 @@ def test_list_projects(client):
     mock_response.json.return_value = [{'id': 1}, {'id': 2}]
 
     with patch.object(client._http, 'get', return_value=mock_response) as get:
-        data = client.list_projects()
+        data = asyncio.run(client.list_projects())
 
     get.assert_called_once_with(
         'http://test/api/v2/projects',
@@ -151,7 +151,7 @@ def test_generate_data_binary_format_sends_accept_star(client):
     mock_response.headers = {'content-type': 'application/zip'}
 
     with patch.object(client._http, 'post', return_value=mock_response) as post:
-        client.generate_data([{'name': 'first_name', 'type': 'first_name', 'options': {}}], fmt='parquet')
+        asyncio.run(client.generate_data([{'name': 'first_name', 'type': 'first_name', 'options': {}}], fmt='parquet'))
 
     assert post.call_args[1]['headers']['Accept'] == '*/*'
 
@@ -163,7 +163,7 @@ def test_generate_data_text_format_keeps_accept_json(client):
     mock_response.headers = {'content-type': 'text/csv'}
 
     with patch.object(client._http, 'post', return_value=mock_response) as post:
-        client.generate_data([{'name': 'first_name', 'type': 'first_name', 'options': {}}], fmt='csv')
+        asyncio.run(client.generate_data([{'name': 'first_name', 'type': 'first_name', 'options': {}}], fmt='csv'))
 
     assert post.call_args[1]['headers']['Accept'] == 'application/json'
 
@@ -176,7 +176,7 @@ def test_generate_project_sends_format_in_body_not_query(client):
     mock_response.headers = {'content-type': 'application/zip'}
 
     with patch.object(client._http, 'post', return_value=mock_response) as post:
-        resp = client.generate_project(42, fmt='zip')
+        resp = asyncio.run(client.generate_project(42, fmt='zip'))
 
     post.assert_called_once()
     args, kwargs = post.call_args
@@ -185,3 +185,28 @@ def test_generate_project_sends_format_in_body_not_query(client):
     assert 'params' not in kwargs
     assert kwargs['headers']['Accept'] == '*/*'
     assert resp.status_code == 200
+
+
+@pytest.mark.parametrize('base_url', ['ftp://example.com', 'not a url', 'http://[bad', 'https://'])
+def test_unusable_base_url_is_a_configuration_error(base_url):
+    with pytest.raises(ConfigurationError, match='GENERATE_DATA_API_BASE_URL'):
+        GenerateDataClient(api_key='k', base_url=base_url)
+
+
+def test_base_url_with_api_path_is_a_configuration_error():
+    with pytest.raises(ConfigurationError, match='/api/v2'):
+        GenerateDataClient(api_key='k', base_url='https://generate-data.com/api/v2')
+
+
+def test_non_json_200_raises_unexpected_response(client):
+    response = httpx.Response(200, text='<html>', request=httpx.Request('GET', 'http://test/x'))
+    with patch.object(client._http, 'get', return_value=response):
+        with pytest.raises(UnexpectedResponse):
+            asyncio.run(client.get_usage())
+
+
+def test_wrong_json_shape_raises_unexpected_response(client):
+    response = httpx.Response(200, json={'results': []}, request=httpx.Request('GET', 'http://test/x'))
+    with patch.object(client._http, 'get', return_value=response):
+        with pytest.raises(UnexpectedResponse):
+            asyncio.run(client.list_projects())
