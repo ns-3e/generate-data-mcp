@@ -159,8 +159,9 @@ Every tool declares read-only and destructive hints, so MCP clients can decide w
 | Dataset formats | CSV | CSV, JSON, XML, YAML, SQL, JSONL, Parquet, XLSX, HF Datasets |
 | Project formats | ZIP | ZIP, XLSX, Neo4j, JSON-LD, bundle |
 | Daily API calls | 10 | 1,000 |
+| Daily AI design calls (`gd_design_schema`, `gd_design_project`) | 3 | No daily quota |
 
-Limits are enforced by the Django API, not this MCP server.
+Limits are enforced by the Django API, not this MCP server. Daily limits reset at 00:00 UTC. AI design calls have their own quota: they count toward your daily calls but aren't blocked by that limit. Rows added by `duplication_config` stay within the row limit, and many-to-many junction rows have their own budget equal to the row limit, so a project can deliver up to twice it. `data.warnings` says when rows were trimmed.
 
 ## Configuration
 

@@ -88,9 +88,11 @@ present, the data may be incomplete or have empty values, so read it before usin
 result. Every failure is an error envelope that says what to do next. Only retry when \
 error.retriable is true.
 
-AI schema and Project design each use one daily call and are refused at the limit. Rows \
-for many-to-many relationships are limited to a budget set by the plan, so a junction \
-table can have fewer rows than the relationship could produce.
+AI schema and Project design share their own daily quota (3 a day on Free). They count \
+toward calls_today but aren't blocked by the daily call limit. Rows added by \
+settings.duplication_config are limited to the plan's row cap, and rows for many-to-many \
+relationships to a budget set by the plan, so a result can have fewer rows than requested. \
+Both are reported in data.warnings when rows are trimmed.
 """
 
 mcp = _GenerateDataServer('generate-data', instructions=_INSTRUCTIONS)
@@ -171,7 +173,7 @@ class GenerationSettings(BaseModel):
     line_ending: str | None = Field(None, description='CSV line endings: unix (default), windows or mac.')
     data_quality_level: str | None = Field(None, description='How clean the values are. Default clean.')
     is_distinct: bool | None = Field(None, description='Avoid duplicate rows. Default true.')
-    duplication_config: dict[str, Any] | None = Field(None, description='Controls for adding duplicate records.')
+    duplication_config: dict[str, Any] | None = Field(None, description="Controls for adding duplicate records. Output stays within the plan's row cap; data.warnings says if rows were trimmed.")
     realism_mode: str | None = Field(None, description='independent, coherent (default) or dirty.')
     company_type: str | None = Field(None, description='Kind of companies to reflect in the data. Default mixed.')
     industry: str | None = Field(None, description='Limit the data to one industry.')
@@ -195,6 +197,13 @@ def _plain(value: Any) -> Any:
         return [_plain(item) for item in value]
     return value
 
+
+# Quotas that only reset at 00:00 UTC, so retrying the same day can't succeed.
+_DAILY_QUOTAS = {
+    'daily_call_limit': ('calls', 'daily API call limit'),
+    'daily_export_limit': ('exports', 'daily export limit'),
+    'ai_quota_exceeded': ('ai_design', 'daily AI design quota'),
+}
 
 _TIER_CODES = frozenset({
     'format_not_allowed',
@@ -256,12 +265,13 @@ def _classify_http_error(status_code: int, body: Any, headers: Any = None) -> tu
     said = f' The API said: {_quoted(upstream_msg)}.' if upstream_msg else ''
     details: dict[str, Any] = {}
 
-    if upstream_code == 'daily_call_limit':
+    if upstream_code in _DAILY_QUOTAS:
+        quota, name = _DAILY_QUOTAS[upstream_code]
         resets_at = _next_utc_midnight()
-        details.update(limit='daily', resets_at=resets_at)
+        details.update(limit='daily', quota=quota, resets_at=resets_at)
         return (
             'rate_limited',
-            f'The daily API call limit is used up, so retrying today will not help. It resets at {resets_at}.{said}',
+            f'The {name} is used up, so retrying today will not help. It resets at {resets_at}.{said}',
             False,
             details,
         )
@@ -569,7 +579,8 @@ async def gd_generate_dataset(
     (get valid `type` values from `gd_list_field_types`/`gd_get_field_type_options`).
     `format` is one of `csv`, `json`, `xml`, `yaml`, `sql`, `jsonl`, `parquet`,
     `xlsx`, `hf-datasets`; Free keys can only use `csv` (others return
-    `tier_forbidden`). `num_rows` is capped by plan: 100 on Free, 10,000 on Pro.
+    `tier_forbidden`). `num_rows` is capped by plan: 100 on Free, 10,000 on Pro,
+    and rows added by `settings.duplication_config` stay within that cap.
     `settings` holds optional generation settings. `ai_groups` is only for
     `ai_generated` fields (Pro) whose values should relate: each group names the
     `columns` to generate together from one `prompt`. Small results come back inline: `data.content` (text formats) or
@@ -637,7 +648,10 @@ async def gd_design_schema(
       `data.proposed_schema` array from the prior call). `prompt` is not used.
     Passing only one of `messages`/`current_schema`, or neither of them and no
     `prompt`, returns `invalid_input`. Returns `data.proposed_schema`, an array
-    you can pass directly to `gd_generate_dataset` as `fields`."""
+    you can pass directly to `gd_generate_dataset` as `fields`. Each call uses the
+    daily AI design quota (3 a day on Free, shared with `gd_design_project`): at the
+    quota it returns a non-retriable `rate_limited` error with `details.resets_at`.
+    It counts toward `calls_today` but isn't blocked by the daily call limit."""
     if (messages is None) != (current_schema is None):
         return _err('invalid_input', 'To refine, pass both messages and current_schema. To propose, pass only prompt.')
     if messages is None and not (prompt or '').strip():
@@ -699,9 +713,10 @@ async def gd_generate_project(project_id: ProjectId, format: ProjectFormat = 'zi
     `data.content_base64` (`zip`, `xlsx`, `neo4j` — never decode these as utf-8)
     or `data.content` (`jsonld`, `bundle`). Results too large to return inline, or
     any result when `save_to_file` is true, are saved in full and returned as
-    `data.file_path`: read that file rather than regenerating. Failures return an
-    error envelope saying what to do next; don't retry unless `error.retriable`
-    is true."""
+    `data.file_path`: read that file rather than regenerating. If `data.warnings`
+    is present the data may be incomplete or have empty values, so read it first.
+    Failures return an error envelope saying what to do next; don't retry unless
+    `error.retriable` is true."""
     try:
         project_id = _validate_project_id(project_id)
     except ValueError as exc:
@@ -729,8 +744,8 @@ async def gd_generate_project_inline(
     """Generate multi-table data once, without saving a Project. Takes the same
     `tables` and `relationships` as `gd_create_project`, or the `project` from
     `gd_design_project`, and returns results the same way as
-    `gd_generate_project`, including the budget on many-to-many rows. Free keys can
-    only use `zip`."""
+    `gd_generate_project`, including the budget on many-to-many rows and
+    `data.warnings`. Free keys can only use `zip`."""
     fmt = format.lower()
     if fmt not in _PROJECT_FORMATS:
         return _err(
@@ -850,7 +865,10 @@ async def gd_design_project(prompt: str) -> CallToolResult:
     `tables`, `relationships`, `settings` and `domain_pack`: pass those to
     `gd_generate_project_inline` for a one-off result or `gd_create_project` to
     save it. Row counts in the proposal may exceed the current plan's limits. Each
-    call uses one daily API call and is refused once the daily limit is reached."""
+    call uses the daily AI design quota (3 a day on Free, shared with
+    `gd_design_schema`): at the quota it returns a non-retriable `rate_limited`
+    error with `details.resets_at`. It counts toward `calls_today` but isn't blocked
+    by the daily call limit."""
     result = await _client().propose_project(prompt)
     project = result.get('project')
     if not isinstance(project, dict):

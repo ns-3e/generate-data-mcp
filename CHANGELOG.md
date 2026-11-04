@@ -51,6 +51,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ZIP-family files that don't open, broken JSON, truncated Parquet, and bodies that are
   only an `{error: ...}` object.
 - A failed file write no longer leaves a partial file behind.
+- The daily AI design quota (`ai_quota_exceeded`) was reported as a retriable rate limit.
+  It is now `rate_limited` with `retriable: false` and `details.resets_at`, as is
+  `daily_export_limit`. Docs said AI design is refused at the daily call limit; it has
+  its own quota and isn't.
 
 ### Security
 

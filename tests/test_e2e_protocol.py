@@ -13,6 +13,7 @@ import subprocess
 import threading
 import time
 import zipfile
+from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
@@ -375,6 +376,22 @@ def test_daily_limit_is_not_retriable(api_url):
     error = _assert_failure(result, 'rate_limited')
     assert error['retriable'] is False
     assert 'resets_at' in error['details']
+
+
+@pytest.mark.parametrize('code,quota', [('ai_quota_exceeded', 'ai_design'), ('daily_export_limit', 'exports')])
+@pytest.mark.parametrize('tool,args', [
+    ('gd_design_project', {'prompt': 'a store'}),
+    ('gd_design_schema', {'prompt': 'customers'}),
+], ids=['project', 'schema'])
+def test_daily_quotas_are_not_retriable(api_url, tool, args, code, quota):
+    FakeApi.override = (429, {'error': 'Daily limit reached.', 'code': code, 'usage': {'remaining': 0}})
+    [result] = _call_results(api_url, (tool, args))
+    error = _assert_failure(result, 'rate_limited')
+    assert error['retriable'] is False
+    assert error['details']['quota'] == quota
+    assert error['details']['resets_at'].endswith('T00:00:00+00:00')
+    assert 'retrying today will not help' in error['message']
+    assert 'Wait before' not in error['message']
 
 
 def test_retry_after_is_surfaced(api_url):
@@ -952,3 +969,47 @@ def test_saved_file_is_complete_with_no_temporary_left(api_url, output_dir):
     files = list(output_dir.iterdir())
     assert [str(p) for p in files] == [result['data']['file_path']]
     assert files[0].read_text() == 'id\n1\n2\n3\n'
+
+
+# ---------------------------------------------------------------------------
+# Project results carry warnings; hostile names can't steer saved files
+# ---------------------------------------------------------------------------
+
+_PROJECT_CALLS = [
+    ('gd_generate_project', {'project_id': 7}),
+    ('gd_generate_project_inline', {'tables': PROJECT['tables']}),
+]
+
+
+@pytest.mark.parametrize('tool,args', _PROJECT_CALLS, ids=['saved', 'inline'])
+@pytest.mark.parametrize('fmt,extra', [
+    ('zip', {}),
+    ('bundle', {}),
+    ('zip', {'save_to_file': True}),
+    ('bundle', {'save_to_file': True}),
+], ids=['binary', 'text', 'binary-file', 'text-file'])
+def test_project_warnings_are_surfaced_however_returned(api_url, output_dir, tool, args, fmt, extra):
+    warning = 'Many-to-many rows were limited to the plan budget.'
+    body, content_type = (_zip_bytes(), 'application/zip') if fmt == 'zip' else ({'tables': {}}, 'application/json')
+    FakeApi.override = (200, body, content_type, {'X-Generation-Warnings': json.dumps([warning])})
+    [result] = _call_tools(api_url, (tool, {**args, 'format': fmt, **extra}))
+    assert result['ok'] is True
+    assert result['data']['warnings'] == [warning]
+    assert 'WARNING' in result['summary']
+    assert ('file_path' in result['data']) == bool(extra)
+
+
+@pytest.mark.parametrize('name', ['Orders/Returns', 'v1..2', '../../evil', '/abs/path', 'a\\\\b'])
+def test_table_and_project_names_pass_through_and_cant_steer_files(api_url, output_dir, name):
+    tables = [{**PROJECT['tables'][0], 'name': name}]
+    [result] = _call_tools(api_url, (
+        'gd_generate_project_inline',
+        {'name': name, 'tables': tables, 'save_to_file': True},
+    ))
+    assert result['ok'] is True, result
+    sent = [r for r in FakeApi.requests if r[1].startswith('/api/v2/projects/generate-inline')][-1]
+    assert sent[2]['name'] == name
+    assert sent[2]['tables'][0]['name'] == name
+    saved = Path(result['data']['file_path'])
+    assert saved.parent == output_dir
+    assert saved.name.startswith('project-inline-')
