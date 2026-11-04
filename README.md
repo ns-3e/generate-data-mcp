@@ -6,7 +6,7 @@
 
 An MCP server for [Generate-Data.com](https://generate-data.com) — generate synthetic datasets, design schemas from natural language, and manage Projects, straight from your agent.
 
-Thin HTTP wrapper over the Generate-Data.com API. No generation logic lives in this repo — it's a curated, agent-friendly interface onto the real thing: 7 tools, one consistent response shape, binary-safe output, and server-side validation on every input.
+Thin HTTP wrapper over the Generate-Data.com API. No generation logic lives in this repo — it's a curated, agent-friendly interface onto the real thing: 14 tools, one consistent response shape, binary-safe output, and server-side validation on every input.
 
 ## Installation (30-second setup)
 
@@ -31,7 +31,7 @@ Add this to your MCP client config (Claude Desktop: `claude_desktop_config.json`
 }
 ```
 
-`uvx` fetches and runs the latest published version on demand — no separate install step, nothing to update by hand. Restart your client and the 7 `gd_*` tools are available.
+`uvx` fetches and runs the latest published version on demand — no separate install step, nothing to update by hand. Restart your client and the 14 `gd_*` tools are available.
 
 > Do not commit a config file containing your real API key.
 
@@ -122,16 +122,32 @@ v2.0.0 renames every tool (breaking change). Old name → new name:
 
 ## Reference
 
-All 7 tools work on every plan, within that plan's limits.
+All 14 tools work on every plan, within that plan's limits.
 
-- **[gd_generate_dataset](./generate_data_mcp/server.py)** — Generate synthetic dataset rows from a field list. `format`: `csv`, `json`, `xml`, `yaml`, `sql`, `jsonl`, `parquet`, `xlsx`, or `hf-datasets` (`parquet`, `xlsx` and `hf-datasets` return base64-encoded).
-- **[gd_list_field_types](./generate_data_mcp/server.py)** — List all available field types grouped by category. Takes no arguments.
-- **[gd_get_field_type_options](./generate_data_mcp/server.py)** — Get the configuration option schema for one field type. `field_type` must match `^[a-z0-9_]+$`.
-- **[gd_design_schema](./generate_data_mcp/server.py)** — Design a dataset schema from natural language, or refine an existing one — one tool for both the first proposal and follow-up conversation turns.
-- **[gd_get_usage](./generate_data_mcp/server.py)** — Get current API key usage stats: calls today, tier, limits. Takes no arguments.
+### Generate data
 
-- **[gd_list_projects](./generate_data_mcp/server.py)** — List the user's Projects, paginated (`limit`/`offset`, default 20/0).
-- **[gd_generate_project](./generate_data_mcp/server.py)** — Generate all tables in a Project and download the result. `format`: `zip`, `xlsx`, `neo4j` (base64-encoded), `jsonld`, or `bundle`.
+- **gd_generate_dataset** — Generate rows from a field list. `format`: `csv`, `json`, `xml`, `yaml`, `sql`, `jsonl`, `parquet`, `xlsx`, or `hf-datasets` (the last three return base64-encoded). Optional `settings`, `ai_groups` (Pro, for `ai_generated` columns that should relate) and `save_to_file`. Returns `rows` and `calls_remaining` when the API reports them.
+- **gd_generate_project** — Generate all tables in a saved Project. `format`: `zip`, `xlsx`, `neo4j` (base64-encoded), `jsonld`, or `bundle`.
+- **gd_generate_project_inline** — Generate multi-table data once, without saving a Project. Same formats as `gd_generate_project`.
+
+### Design and discover
+
+- **gd_design_schema** — Propose a dataset schema from natural language, or refine one by passing `messages` and `current_schema`.
+- **gd_design_project** — Propose a multi-table Project from natural language. Nothing is saved.
+- **gd_list_field_types** — List all field types grouped by category.
+- **gd_get_field_type_options** — Get the option schema for one field type. `field_type` must match `^[a-z0-9_]+$`.
+- **gd_validate_field_options** — Check options for a field type without generating anything. Returns `is_valid` and `errors`.
+- **gd_get_usage** — Get your plan, calls today and limits.
+
+### Manage Projects
+
+- **gd_list_projects** — List your Projects, paginated (`limit`/`offset`, default 20/0).
+- **gd_get_project** — Get one Project with its tables and relationships.
+- **gd_create_project** — Save a Project from `name`, `tables` and `relationships`.
+- **gd_update_project** — Change a Project. Only the arguments you pass change, but each one replaces the saved value completely, so sending `tables` replaces every table.
+- **gd_delete_project** — Permanently delete a Project. Does nothing unless you pass `confirm: true`.
+
+Every tool declares read-only and destructive hints, so MCP clients can decide which calls need your approval. Read-only tools are retried automatically (up to twice) on connection failures, throttling and gateway errors. Anything that can create data or use quota is never retried automatically.
 
 ### Tier limits (API key)
 

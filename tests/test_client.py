@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 import httpx
 import pytest
 
-from generate_data_mcp.client import ConfigurationError, GenerateDataClient, UnexpectedResponse
+from generate_data_mcp.client import ConfigurationError, GenerateDataClient, UnexpectedResponse, insecure_base_url_warning
 
 
 @pytest.fixture
@@ -210,3 +210,16 @@ def test_wrong_json_shape_raises_unexpected_response(client):
     with patch.object(client._http, 'get', return_value=response):
         with pytest.raises(UnexpectedResponse):
             asyncio.run(client.list_projects())
+
+
+@pytest.mark.parametrize('base_url', ['http://example.test', 'http://10.0.0.5:8000'])
+def test_insecure_warning_for_remote_plain_http(base_url):
+    warning = insecure_base_url_warning(base_url)
+    assert warning and 'unencrypted' in warning
+
+
+@pytest.mark.parametrize('base_url', [
+    None, '', 'https://example.test', 'http://localhost:8001', 'http://127.0.0.1', 'http://[::1]:8001', 'http://[bad',
+])
+def test_no_insecure_warning(base_url):
+    assert insecure_base_url_warning(base_url) is None

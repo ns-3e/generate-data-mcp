@@ -17,11 +17,17 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
+import generate_data_mcp
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 API_KEY = 'e2e-test-key'
 FIELDS = [{'name': 'id', 'type': 'row_number', 'options': {}}]
+PROJECT = {
+    'name': 'demo',
+    'tables': [{'name': 'customers', 'num_rows': 2, 'schema': FIELDS}],
+    'relationships': [],
+}
 
 
 def _zip_bytes() -> bytes:
@@ -36,6 +42,8 @@ class FakeApi(BaseHTTPRequestHandler):
 
     override = None  # (status, body, content_type[, headers]) forced for failure-mode tests
     delay = 0  # seconds to wait before answering
+    sequence = []  # one-shot overrides, used in order before `override`
+    requests = []  # (method, path, parsed body, headers) of every request received
 
     def log_message(self, *args):
         pass
@@ -55,8 +63,11 @@ class FakeApi(BaseHTTPRequestHandler):
         length = int(self.headers.get('content-length') or 0)
         raw = self.rfile.read(length)
         body = json.loads(raw) if raw else {}
+        FakeApi.requests.append((self.command, self.path, body, dict(self.headers)))
         if FakeApi.delay:
             time.sleep(FakeApi.delay)
+        if FakeApi.sequence:
+            return self._send(*FakeApi.sequence.pop(0))
         if FakeApi.override:
             return self._send(*FakeApi.override)
         if self.headers.get('X-API-Key') != API_KEY:
@@ -65,13 +76,45 @@ class FakeApi(BaseHTTPRequestHandler):
         # DRF treats ?format= as renderer selection: unknown renderer means 404.
         if parse_qs(url.query).get('format', ['json'])[0] not in ('json', 'api'):
             return self._send(404, {'detail': 'Not found.'})
-        return self._route(url.path, body)
+        return self._route(self.command, url.path, body)
 
-    def _route(self, path, body):
+    def _route(self, method, path, body):
         if path == '/api/v2/generate':
             rows = body.get('num_rows', 1)
             csv = 'id\n' + ''.join(f'{i + 1}\n' for i in range(rows))
-            return self._send(200, csv.encode(), 'text/csv', {'X-Usage-Rows-Generated': str(rows)})
+            return self._send(200, csv.encode(), 'text/csv', {
+                'X-Usage-Rows-Generated': str(rows),
+                'X-Usage-Calls-Today': '4',
+                'X-Usage-Calls-Remaining': '6',
+            })
+        if path == '/api/v2/field-types/word/validate':
+            problems = [] if body.get('options') == {'ok': True} else ['bad option']
+            return self._send(200, {'is_valid': not problems, 'errors': problems})
+        if path == '/api/v2/ai/project/propose':
+            if not (body.get('prompt') or '').strip():
+                return self._send(400, {'error': 'prompt is required'})
+            return self._send(200, {'project': {**PROJECT, 'settings': {}, 'domain_pack': ''}})
+        if path == '/api/v2/projects/generate-inline':
+            if not body.get('tables'):
+                return self._send(400, {'error': 'tables are required'})
+            if body.get('format') == 'bundle':
+                return self._send(200, {'tables': {t['name']: [] for t in body['tables']}})
+            return self._send(200, _zip_bytes(), 'application/zip')
+        if path == '/api/v2/projects/7' and method == 'GET':
+            return self._send(200, {'id': 7, **PROJECT})
+        if path == '/api/v2/projects/7' and method == 'PUT':
+            return self._send(200, {'id': 7, **PROJECT, **body})
+        if path == '/api/v2/projects/7' and method == 'DELETE':
+            return self._send(204)
+        if path == '/api/v2/projects' and method == 'POST':
+            if not (body.get('name') or '').strip():
+                return self._send(400, {'error': 'name is required'})
+            if any(r.get('from_table') == 'missing' for r in body.get('relationships') or []):
+                return self._send(400, {
+                    'error': 'Invalid relationships',
+                    'details': ['relationships[0]: unknown from_table'],
+                })
+            return self._send(201, {'id': 8, **body})
         if path == '/api/v2/field-types':
             return self._send(200, {'categories': {'Basic': [{'value': 'word'}]}})
         if path == '/api/v2/field-types/word/options':
@@ -93,7 +136,7 @@ class FakeApi(BaseHTTPRequestHandler):
             return self._send(200, _zip_bytes(), 'application/zip')
         return self._send(404, {'detail': 'Not found.'})
 
-    do_GET = do_POST = _handle
+    do_GET = do_POST = do_PUT = do_DELETE = _handle
 
 
 @pytest.fixture(scope='module')
@@ -109,9 +152,12 @@ def api_url():
 def _reset_stub():
     FakeApi.override = None
     FakeApi.delay = 0
+    FakeApi.sequence = []
+    FakeApi.requests = []
     yield
     FakeApi.override = None
     FakeApi.delay = 0
+    FakeApi.sequence = []
 
 
 @pytest.fixture(autouse=True)
@@ -399,3 +445,311 @@ def test_bad_base_url_says_to_check_it_and_is_not_retriable(base_url):
 def test_refused_connection_is_retriable():
     [result] = _call_results('http://127.0.0.1:9', ('gd_get_usage', {}))
     assert _assert_failure(result, 'upstream_unavailable')['retriable'] is True
+
+
+# ---------------------------------------------------------------------------
+# Project tools
+# ---------------------------------------------------------------------------
+
+def _writes():
+    return [r for r in FakeApi.requests if r[0] in ('POST', 'PUT', 'DELETE')]
+
+
+def test_design_then_generate_inline_then_create(api_url):
+    [designed] = _call_tools(api_url, ('gd_design_project', {'prompt': 'a store'}))
+    project = designed['data']['project']
+    arguments = {key: project[key] for key in ('name', 'tables', 'relationships')}
+    inline, created = _call_tools(
+        api_url,
+        ('gd_generate_project_inline', arguments),
+        ('gd_create_project', arguments),
+    )
+    assert zipfile.ZipFile(io.BytesIO(base64.b64decode(inline['data']['content_base64']))).namelist()
+    assert created['data']['id'] == 8
+
+
+def test_inline_format_goes_in_the_body(api_url):
+    [result] = _call_tools(api_url, ('gd_generate_project_inline', {'tables': PROJECT['tables'], 'format': 'bundle'}))
+    assert json.loads(result['data']['content'])['tables'] == {'customers': []}
+    method, path, body, _ = FakeApi.requests[-1]
+    assert (method, path) == ('POST', '/api/v2/projects/generate-inline')
+    assert body['format'] == 'bundle'
+
+
+def test_get_project(api_url):
+    [result] = _call_tools(api_url, ('gd_get_project', {'project_id': 7}))
+    assert result['data']['tables'] == PROJECT['tables']
+
+
+def test_get_project_not_found(api_url):
+    [result] = _call_tools(api_url, ('gd_get_project', {'project_id': 99}))
+    assert result['error']['code'] == 'not_found'
+
+
+def test_update_sends_only_the_arguments_given(api_url):
+    empty_rels, renamed = _call_tools(
+        api_url,
+        ('gd_update_project', {'project_id': 7, 'relationships': []}),
+        ('gd_update_project', {'project_id': 7, 'name': 'renamed'}),
+    )
+    assert empty_rels['ok'] is True and renamed['data']['name'] == 'renamed'
+    assert [(r[0], r[2]) for r in _writes()] == [('PUT', {'relationships': []}), ('PUT', {'name': 'renamed'})]
+
+
+def test_update_with_nothing_to_change_never_calls_the_api(api_url):
+    [result] = _call_tools(api_url, ('gd_update_project', {'project_id': 7}))
+    assert result['error']['code'] == 'invalid_input'
+    assert _writes() == []
+
+
+@pytest.mark.parametrize('arguments', [{'project_id': 7}, {'project_id': 7, 'confirm': False}], ids=['omitted', 'false'])
+def test_delete_without_confirm_never_calls_the_api(api_url, arguments):
+    [result] = _call_tools(api_url, ('gd_delete_project', arguments))
+    assert result['error']['code'] == 'invalid_input'
+    assert 'Nothing was deleted' in result['error']['message']
+    assert FakeApi.requests == []
+
+
+def test_delete_with_confirm(api_url):
+    [result] = _call_tools(api_url, ('gd_delete_project', {'project_id': 7, 'confirm': True}))
+    assert result['data'] == {'id': 7, 'deleted': True}
+    assert [(r[0], r[1]) for r in _writes()] == [('DELETE', '/api/v2/projects/7')]
+
+
+def test_relationship_errors_reach_the_agent(api_url):
+    [result] = _call_tools(api_url, ('gd_create_project', {
+        'name': 'x', 'tables': PROJECT['tables'], 'relationships': [{'from_table': 'missing'}],
+    }))
+    assert result['error']['code'] == 'invalid_input'
+    assert 'unknown from_table' in result['error']['message']
+
+
+def test_validate_field_options_invalid_is_a_normal_result(api_url):
+    valid, invalid, unknown = _call_tools(
+        api_url,
+        ('gd_validate_field_options', {'field_type': 'word', 'options': {'ok': True}}),
+        ('gd_validate_field_options', {'field_type': 'word', 'options': {'ok': False}}),
+        ('gd_validate_field_options', {'field_type': 'nope', 'options': {}}),
+    )
+    assert valid['data']['is_valid'] is True
+    assert invalid['ok'] is True and invalid['data']['errors'] == ['bad option']
+    assert unknown['error']['code'] == 'not_found'
+
+
+# ---------------------------------------------------------------------------
+# Schemas, annotations and server metadata
+# ---------------------------------------------------------------------------
+
+def _list_tools(api_url):
+    async def body(session):
+        return {tool.name: tool for tool in (await session.list_tools()).tools}
+    return _with_session(api_url, body)
+
+
+EXPECTED_HINTS = {
+    # name: (readOnly, destructive, idempotent)
+    'gd_list_field_types': (True, False, True),
+    'gd_get_field_type_options': (True, False, True),
+    'gd_validate_field_options': (True, False, True),
+    'gd_get_usage': (True, False, True),
+    'gd_list_projects': (True, False, True),
+    'gd_get_project': (True, False, True),
+    'gd_design_schema': (False, False, False),
+    'gd_design_project': (False, False, False),
+    'gd_generate_dataset': (False, False, False),
+    'gd_generate_project': (False, False, False),
+    'gd_generate_project_inline': (False, False, False),
+    'gd_create_project': (False, False, False),
+    'gd_update_project': (False, True, True),
+    'gd_delete_project': (False, True, True),
+}
+
+
+def test_every_tool_has_title_and_correct_annotations(api_url):
+    tools = _list_tools(api_url)
+    assert set(tools) == set(EXPECTED_HINTS)
+    for name, (read_only, destructive, idempotent) in EXPECTED_HINTS.items():
+        hints = tools[name].annotations
+        assert tools[name].title, name
+        assert (hints.readOnlyHint, hints.destructiveHint, hints.idempotentHint) == (read_only, destructive, idempotent), name
+        assert hints.openWorldHint is True, name
+
+
+def test_input_schemas_declare_enums_and_ranges(api_url):
+    tools = _list_tools(api_url)
+    dataset = tools['gd_generate_dataset'].inputSchema
+    assert set(dataset['properties']['format']['enum']) >= {'csv', 'parquet', 'hf-datasets'}
+    assert dataset['properties']['num_rows']['minimum'] == 1
+    settings = dataset['$defs']['GenerationSettings']
+    assert settings['additionalProperties'] is True
+    assert {'locale', 'seed', 'realism_mode', 'domain_pack'} <= set(settings['properties'])
+    project_format = tools['gd_generate_project_inline'].inputSchema['properties']['format']
+    assert set(project_format['enum']) == {'zip', 'xlsx', 'neo4j', 'jsonld', 'bundle'}
+    limit = tools['gd_list_projects'].inputSchema['properties']['limit']
+    assert (limit['minimum'], limit['maximum']) == (1, 100)
+    assert tools['gd_get_project'].inputSchema['properties']['project_id']['minimum'] == 1
+
+
+@pytest.mark.parametrize('name,arguments,code', [
+    ('gd_generate_dataset', {'fields': FIELDS, 'format': 'zip'}, 'unsupported_format'),
+    ('gd_generate_project', {'project_id': 7, 'format': 'csv'}, 'unsupported_format'),
+    ('gd_generate_project_inline', {'tables': [], 'format': 'csv'}, 'unsupported_format'),
+    ('gd_generate_dataset', {'fields': FIELDS, 'num_rows': 0}, 'invalid_input'),
+    ('gd_list_projects', {'limit': 101}, 'invalid_input'),
+    ('gd_get_project', {'project_id': 0}, 'invalid_input'),
+], ids=['dataset-format', 'project-format', 'inline-format', 'rows', 'limit', 'project-id'])
+def test_schema_violations_are_rejected_before_calling_the_api(api_url, name, arguments, code):
+    [result] = _call_tools(api_url, (name, arguments))
+    assert result['error']['code'] == code
+    assert FakeApi.requests == []
+
+
+def test_format_stays_case_insensitive(api_url):
+    [result] = _call_tools(api_url, ('gd_generate_dataset', {'fields': FIELDS, 'format': 'CSV'}))
+    assert result['ok'] is True
+    assert FakeApi.requests[-1][2]['format'] == 'csv'
+
+
+def test_settings_and_ai_groups_reach_the_api_correctly(api_url):
+    group = {'group_id': 'g1', 'prompt': 'related', 'columns': ['id']}
+    _call_tools(api_url, ('gd_generate_dataset', {
+        'fields': FIELDS,
+        'settings': {'seed': 42, 'some_new_setting': 'kept'},
+        'ai_groups': [group],
+    }))
+    body = FakeApi.requests[-1][2]
+    # Unset settings stay out: a null would override the API's own default.
+    assert body['settings'] == {'seed': 42, 'some_new_setting': 'kept'}
+    assert body['ai_groups'] == [group]
+
+
+def test_malformed_ai_group_is_rejected_not_silently_dropped(api_url):
+    [result] = _call_tools(api_url, ('gd_generate_dataset', {
+        'fields': FIELDS, 'ai_groups': [{'group_id': 'g1', 'prompt': 'x', 'columns': []}],
+    }))
+    assert result['error']['code'] == 'invalid_input'
+    assert FakeApi.requests == []
+
+
+def test_generate_reports_rows_and_remaining_calls(api_url):
+    [result] = _call_tools(api_url, ('gd_generate_dataset', {'fields': FIELDS, 'num_rows': 2}))
+    assert (result['data']['rows'], result['data']['calls_today'], result['data']['calls_remaining']) == (2, 4, 6)
+
+
+def test_server_info_reports_the_package_version_and_instructions(api_url):
+    params = _server_params(api_url)
+
+    async def run():
+        async with stdio_client(params) as (read, write):
+            async with ClientSession(read, write) as session:
+                return await session.initialize()
+
+    info = asyncio.run(run())
+    assert info.serverInfo.name == 'generate-data'
+    assert info.serverInfo.version == generate_data_mcp.__version__
+    assert 'gd_design_schema' in info.instructions and '10,000 rows' in info.instructions
+
+
+def test_version_flag_prints_and_exits_without_serving():
+    done = subprocess.run(
+        [sys.executable, '-m', 'generate_data_mcp.server', '--version'],
+        capture_output=True, text=True, timeout=20, stdin=subprocess.DEVNULL,
+        env={'PATH': os.environ.get('PATH', '')},
+    )
+    assert done.returncode == 0
+    assert done.stdout.strip() == f'generate-data-mcp {generate_data_mcp.__version__}'
+
+
+# ---------------------------------------------------------------------------
+# User-Agent and retries
+# ---------------------------------------------------------------------------
+
+def test_requests_identify_the_client(api_url):
+    _call_tools(api_url, ('gd_get_usage', {}), ('gd_generate_dataset', {'fields': FIELDS}))
+    for _, _, _, headers in FakeApi.requests:
+        lowered = {k.lower(): v for k, v in headers.items()}
+        assert lowered['user-agent'] == f'generate-data-mcp/{generate_data_mcp.__version__}'
+
+
+USAGE_OK = (200, {'tier': 'FREE', 'calls_today': 1})
+BUSY = (503, {'detail': 'down'})
+
+
+def test_get_retries_gateway_errors_then_succeeds(api_url):
+    FakeApi.sequence = [BUSY, (502, b'', 'text/html'), USAGE_OK]
+    [result] = _call_tools(api_url, ('gd_get_usage', {}))
+    assert result['ok'] is True
+    assert len(FakeApi.requests) == 3
+
+
+def test_get_gives_up_after_two_retries(api_url):
+    FakeApi.override = BUSY
+    [result] = _call_tools(api_url, ('gd_get_usage', {}))
+    assert result['error']['retriable'] is True
+    assert len(FakeApi.requests) == 3
+
+
+def test_get_retries_throttling_using_retry_after(api_url):
+    FakeApi.sequence = [(429, {'detail': 'throttled'}, 'application/json', {'Retry-After': '1'}), USAGE_OK]
+    started = time.monotonic()
+    [result] = _call_tools(api_url, ('gd_get_usage', {}))
+    assert result['ok'] is True
+    assert len(FakeApi.requests) == 2
+    assert time.monotonic() - started >= 1
+
+
+def test_get_does_not_sleep_through_a_long_retry_after(api_url):
+    FakeApi.override = (429, {'detail': 'throttled'}, 'application/json', {'Retry-After': '120'})
+    [result] = _call_tools(api_url, ('gd_get_usage', {}))
+    assert result['error']['details']['retry_after'] == 120
+    assert len(FakeApi.requests) == 1
+
+
+def test_get_never_retries_the_daily_limit(api_url):
+    FakeApi.override = (429, {'error': 'Daily limit', 'code': 'daily_call_limit'})
+    [result] = _call_tools(api_url, ('gd_get_usage', {}))
+    assert result['error']['retriable'] is False
+    assert len(FakeApi.requests) == 1
+
+
+@pytest.mark.parametrize('status', [429, 503])
+@pytest.mark.parametrize('name,arguments', [
+    ('gd_generate_dataset', {'fields': FIELDS}),
+    ('gd_generate_project', {'project_id': 7}),
+    ('gd_generate_project_inline', {'tables': PROJECT['tables']}),
+    ('gd_create_project', {'name': 'x', 'tables': PROJECT['tables']}),
+    ('gd_update_project', {'project_id': 7, 'name': 'x'}),
+    ('gd_delete_project', {'project_id': 7, 'confirm': True}),
+    ('gd_design_schema', {'prompt': 'x'}),
+    ('gd_design_project', {'prompt': 'x'}),
+    ('gd_validate_field_options', {'field_type': 'word', 'options': {}}),
+])
+def test_writes_and_posts_are_never_retried(api_url, name, arguments, status):
+    FakeApi.override = (status, {'detail': 'busy'}, 'application/json', {'Retry-After': '1'})
+    [result] = _call_tools(api_url, (name, arguments))
+    assert result['ok'] is False
+    assert len(FakeApi.requests) == 1
+
+
+def _start_with_base_url(base_url):
+    return subprocess.run(
+        [sys.executable, '-m', 'generate_data_mcp.server'],
+        capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL,
+        env={
+            'PATH': os.environ.get('PATH', ''),
+            'GENERATE_DATA_API_KEY': 'very-secret-key',
+            'GENERATE_DATA_API_BASE_URL': base_url,
+        },
+    )
+
+
+def test_plain_http_to_a_remote_host_warns_without_the_key():
+    done = _start_with_base_url('http://api.example.test')
+    assert 'plain http://' in done.stderr and 'api.example.test' in done.stderr
+    assert 'very-secret-key' not in done.stderr
+    assert done.stdout == ''
+
+
+@pytest.mark.parametrize('base_url', ['https://example.test', 'http://localhost:8001', 'http://127.0.0.1:8001', 'http://[::1]:8001'])
+def test_no_http_warning_for_https_or_loopback(base_url):
+    assert 'plain http://' not in _start_with_base_url(base_url).stderr

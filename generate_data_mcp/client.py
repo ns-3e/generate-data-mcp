@@ -4,15 +4,30 @@ One GenerateDataClient, with one reused httpx.AsyncClient, serves the whole
 server process. The server creates it on the first tool call, so its connection
 pool belongs to the event loop that runs the tools.
 """
+import asyncio
+import ipaddress
 import os
-from typing import Any, Optional
+import re
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from typing import Any, Mapping, Optional
 from urllib.parse import urlsplit
 
 import httpx
 
+from generate_data_mcp import __version__
 from generate_data_mcp._conventions import BINARY_FORMATS
 
 DEFAULT_BASE_URL = 'https://generate-data.com'
+USER_AGENT = f'generate-data-mcp/{__version__}'
+
+# Only GETs are retried: a repeated POST could spend quota or create data twice.
+_MAX_GET_RETRIES = 2
+_RETRY_BASE_DELAY = 0.5
+_RETRY_MAX_DELAY = 5.0
+_RETRIABLE_STATUSES = frozenset({429, 502, 503, 504})
+_RETRY_AFTER_IN_TEXT = re.compile(r'(\d+)\s*seconds?')
+_LOOPBACK_HOSTS = frozenset({'localhost'})
 
 
 class ConfigurationError(ValueError):
@@ -21,6 +36,57 @@ class ConfigurationError(ValueError):
 
 class UnexpectedResponse(Exception):
     """A 2xx response whose body is not what this API returns."""
+
+
+def retry_after_seconds(headers: Optional[Mapping[str, str]], upstream_msg: str = '') -> Optional[int]:
+    """Seconds to wait, from a Retry-After header (delta or HTTP-date) or the
+    "available in N seconds" wording DRF puts in throttled responses."""
+    raw = (headers.get('retry-after') or '').strip() if headers is not None else ''
+    if raw.isdigit():
+        return int(raw)
+    if raw:
+        try:
+            delta = parsedate_to_datetime(raw) - datetime.now(timezone.utc)
+            return max(0, int(delta.total_seconds()))
+        except (TypeError, ValueError):
+            pass
+    match = _RETRY_AFTER_IN_TEXT.search(upstream_msg)
+    return int(match.group(1)) if match else None
+
+
+def is_dns_failure(exc: httpx.ConnectError) -> bool:
+    text = str(exc).lower()
+    return any(s in text for s in ('name or service not known', 'nodename nor servname', 'getaddrinfo', 'name resolution'))
+
+
+def insecure_base_url_warning(base_url: Optional[str]) -> Optional[str]:
+    """A warning when the API key would cross a network unencrypted, else None."""
+    if not base_url:
+        return None
+    try:
+        parts = urlsplit(base_url)
+        host = parts.hostname
+    except ValueError:
+        return None
+    if parts.scheme != 'http' or not host or host.lower() in _LOOPBACK_HOSTS:
+        return None
+    try:
+        if ipaddress.ip_address(host).is_loopback:
+            return None
+    except ValueError:
+        pass
+    return (
+        f'WARNING: GENERATE_DATA_API_BASE_URL uses plain http:// to {host}, '
+        'so your API key is sent unencrypted. Use https:// unless this is a trusted local network.'
+    )
+
+
+def _is_daily_limit(response: httpx.Response) -> bool:
+    try:
+        body = response.json()
+    except ValueError:
+        return False
+    return isinstance(body, dict) and body.get('code') == 'daily_call_limit'
 
 
 def _validated_base_url(raw: str) -> str:
@@ -57,7 +123,7 @@ class GenerateDataClient:
             base_url or os.environ.get('GENERATE_DATA_API_BASE_URL') or DEFAULT_BASE_URL
         )
         self.timeout = timeout
-        self._http = httpx.AsyncClient(timeout=timeout)
+        self._http = httpx.AsyncClient(timeout=timeout, headers={'User-Agent': USER_AGENT})
 
     def _headers(self, accept: str = 'application/json') -> dict[str, str]:
         # Binary downloads pass Accept: */* so an upstream that honors Accept
@@ -83,13 +149,42 @@ class GenerateDataClient:
             raise UnexpectedResponse(f'JSON of an unexpected shape ({type(body).__name__})')
         return body
 
+    async def _get_with_retries(self, path: str) -> httpx.Response:
+        """GET, retrying connection failures, throttling and gateway errors. A wait
+        longer than the cap is not slept through: the caller gets the response and
+        can report `retry_after`. The daily limit won't lift, so it is never retried."""
+        for attempt in range(_MAX_GET_RETRIES + 1):
+            delay = _RETRY_BASE_DELAY * 2 ** attempt
+            try:
+                response = await self._http.get(self._url(path), headers=self._headers(), timeout=30)
+            except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+                if attempt == _MAX_GET_RETRIES or (isinstance(exc, httpx.ConnectError) and is_dns_failure(exc)):
+                    raise
+            else:
+                if (
+                    attempt == _MAX_GET_RETRIES
+                    or response.status_code not in _RETRIABLE_STATUSES
+                    or _is_daily_limit(response)
+                ):
+                    return response
+                retry_after = retry_after_seconds(response.headers)
+                if retry_after is not None:
+                    delay = retry_after
+                if delay > _RETRY_MAX_DELAY:
+                    return response
+            await asyncio.sleep(delay)
+        raise AssertionError('unreachable: the last attempt returns or raises')
+
     async def _get_json(self, path: str, expected: type = dict) -> Any:
-        response = await self._http.get(self._url(path), headers=self._headers(), timeout=30)
-        return self._parse(response, expected)
+        return self._parse(await self._get_with_retries(path), expected)
 
     async def _post_json(self, path: str, payload: dict, expected: type = dict) -> Any:
         response = await self._http.post(self._url(path), json=payload, headers=self._headers(), timeout=60)
         return self._parse(response, expected)
+
+    async def _put_json(self, path: str, payload: dict) -> dict:
+        response = await self._http.put(self._url(path), json=payload, headers=self._headers(), timeout=60)
+        return self._parse(response, dict)
 
     async def generate_data(
         self,
@@ -97,6 +192,7 @@ class GenerateDataClient:
         num_rows: int = 100,
         fmt: str = 'csv',
         settings: Optional[dict] = None,
+        ai_groups: Optional[list[dict]] = None,
     ) -> httpx.Response:
         payload: dict[str, Any] = {
             'fields': fields,
@@ -105,6 +201,9 @@ class GenerateDataClient:
         }
         if settings:
             payload['settings'] = settings
+        if ai_groups:
+            # A sibling of `fields`, not part of `settings`.
+            payload['ai_groups'] = ai_groups
         accept = '*/*' if fmt in BINARY_FORMATS else 'application/json'
         return await self._http.post(
             self._url('/api/v2/generate'),
@@ -129,6 +228,36 @@ class GenerateDataClient:
 
     async def list_projects(self) -> list:
         return await self._get_json('/api/v2/projects', expected=list)
+
+    async def get_project(self, project_id: int) -> dict:
+        return await self._get_json(f'/api/v2/projects/{project_id}')
+
+    async def create_project(self, payload: dict) -> dict:
+        return await self._post_json('/api/v2/projects', payload)
+
+    async def update_project(self, project_id: int, payload: dict) -> dict:
+        return await self._put_json(f'/api/v2/projects/{project_id}', payload)
+
+    async def delete_project(self, project_id: int) -> None:
+        response = await self._http.delete(self._url(f'/api/v2/projects/{project_id}'), headers=self._headers(), timeout=30)
+        # Success is 204 with no body, so there is nothing to parse.
+        response.raise_for_status()
+
+    async def propose_project(self, prompt: str) -> dict:
+        return await self._post_json('/api/v2/ai/project/propose', {'prompt': prompt})
+
+    async def validate_field_options(self, field_type: str, options: dict) -> dict:
+        return await self._post_json(f'/api/v2/field-types/{field_type}/validate', {'options': options})
+
+    async def generate_project_inline(self, payload: dict, fmt: str = 'zip') -> httpx.Response:
+        accept = '*/*' if fmt in BINARY_FORMATS else 'application/json'
+        return await self._http.post(
+            self._url('/api/v2/projects/generate-inline'),
+            # In the body for the same reason as generate_project below.
+            json={**payload, 'format': fmt},
+            headers=self._headers(accept=accept),
+            timeout=120,
+        )
 
     async def generate_project(self, project_id: int, fmt: str = 'zip') -> httpx.Response:
         accept = '*/*' if fmt in BINARY_FORMATS else 'application/json'

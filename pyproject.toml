@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "generate-data-mcp"
-version = "2.1.0"
+version = "2.2.0"
 description = "MCP server for Generate-Data.com — thin proxy to /api/v2/"
 readme = "README.md"
 requires-python = ">=3.10"

@@ -1,13 +1,14 @@
 # Docker MCP catalog entry (community-built tier) for generate-data-mcp.
-# _note: image not yet built/pushed as of authoring — placeholder tag below.
+# NOT YET AVAILABLE: this image has not been built or pushed, so the tag below is a
+# placeholder. Build it from the Dockerfile before submitting this entry.
 # See registry-research.md §3 (github.com/docker/mcp-registry) for submission flow.
 name: generate-data-mcp
 title: Generate-Data.com
 description: >-
   MCP server for Generate-Data.com — generate synthetic datasets from a field
   schema, design schemas from natural language, discover field types, check
-  API usage, and list/generate multi-table Projects.
-image: ns-3e/generate-data-mcp:2.1.0
+  API usage, and create, manage and generate multi-table Projects.
+image: ns-3e/generate-data-mcp:2.2.0
 type: server
 source:
   project: https://github.com/ns-3e/generate-data-mcp
@@ -19,14 +20,28 @@ tools:
     description: List all available field types grouped by category.
   - name: gd_get_field_type_options
     description: Get the configuration option schema for one field type.
+  - name: gd_validate_field_options
+    description: Check whether options are valid for a field type.
   - name: gd_design_schema
     description: Design a dataset schema from natural language, or refine an existing one via conversation.
   - name: gd_get_usage
     description: Get current API key usage stats (calls today, tier, limits).
+  - name: gd_design_project
+    description: Propose a multi-table Project from a description.
+  - name: gd_generate_project_inline
+    description: Generate multi-table data without saving a Project.
   - name: gd_list_projects
     description: List the user's Projects (paginated).
+  - name: gd_get_project
+    description: Get one saved Project with its tables and relationships.
+  - name: gd_create_project
+    description: Save a multi-table Project.
+  - name: gd_update_project
+    description: Change a saved Project. Each field sent replaces the saved value.
+  - name: gd_delete_project
+    description: Permanently delete a saved Project. Requires confirm.
   - name: gd_generate_project
-    description: Generate all tables in a Project and download the result.
+    description: Generate all tables in a saved Project and download the result.
 secrets:
   - name: GENERATE_DATA_API_KEY
     env: GENERATE_DATA_API_KEY

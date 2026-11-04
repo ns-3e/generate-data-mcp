@@ -426,13 +426,15 @@ def test_gd_generate_project_upstream_error_status():
 # asserted a hardcoded dict against itself and exercised no real code)
 # ---------------------------------------------------------------------------
 
-def test_all_seven_tools_registered_with_fastmcp():
+def test_all_fourteen_tools_registered_with_fastmcp():
     tools = asyncio.run(server.mcp.list_tools())
     names = {t.name for t in tools}
     assert all(t.outputSchema is None for t in tools)
     assert names == {
         'gd_generate_dataset', 'gd_list_field_types', 'gd_get_field_type_options',
         'gd_design_schema', 'gd_get_usage', 'gd_list_projects', 'gd_generate_project',
+        'gd_get_project', 'gd_create_project', 'gd_update_project', 'gd_delete_project',
+        'gd_generate_project_inline', 'gd_design_project', 'gd_validate_field_options',
     }
 
 

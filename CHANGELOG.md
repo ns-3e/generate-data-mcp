@@ -5,6 +5,37 @@ All notable changes to `generate-data-mcp` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.0] - 2026-11-04
+
+### Added
+
+- **Project tools:** `gd_get_project`, `gd_create_project`, `gd_update_project`,
+  `gd_delete_project`, `gd_generate_project_inline` and `gd_design_project`, so agents
+  can create Projects as well as generate them. `gd_delete_project` does nothing
+  unless passed `confirm: true`.
+- **`gd_validate_field_options`** checks options for a field type without generating.
+- **`ai_groups`** on `gd_generate_dataset`, for `ai_generated` columns that should
+  relate. A malformed group is now an `invalid_input` error; the API silently drops it.
+- **`data.calls_today` and `data.calls_remaining`** on generate results, when the API
+  reports them.
+- **Tool metadata:** titles, read-only/destructive/idempotent hints, format enums,
+  numeric ranges, documented `settings` keys (unknown keys still pass through), and
+  server `instructions`.
+- **`--version`**, which prints the version and exits.
+- A startup warning on stderr when `GENERATE_DATA_API_BASE_URL` sends the API key over
+  plain `http://` to a non-loopback host.
+
+### Changed
+
+- Read-only GET tools retry up to twice on connection failures, throttling and
+  gateway errors, honoring `Retry-After` up to 5 seconds. A longer wait is returned as
+  `retry_after` instead. POST, PUT and DELETE are never retried, and neither is the
+  daily limit.
+- Requests send `User-Agent: generate-data-mcp/<version>`.
+- `serverInfo.version` now reports this package's version, not the MCP SDK's.
+- Out-of-range `num_rows`, `limit`, `offset` and `project_id` are rejected before any
+  API call, and relationship errors from the API now list the specific problems.
+
 ## [2.1.0] - 2026-11-04
 
 ### Changed — behavior to check if you parse results
@@ -168,6 +199,7 @@ upstream list.
   `^[a-z0-9_]+$`, `project_id` must be a positive integer, `limit`/`offset` are
   range-checked.
 
+[2.2.0]: https://github.com/ns-3e/generate-data-mcp/releases/tag/v2.2.0
 [2.1.0]: https://github.com/ns-3e/generate-data-mcp/releases/tag/v2.1.0
 [2.0.2]: https://github.com/ns-3e/generate-data-mcp/releases/tag/v2.0.2
 [2.0.1]: https://github.com/ns-3e/generate-data-mcp/releases/tag/v2.0.1
