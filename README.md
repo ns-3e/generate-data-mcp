@@ -87,7 +87,7 @@ A typical session looks like this — the agent chains tools on its own, you jus
 1. **Discover what's possible.** `gd_list_field_types` — see every field type, grouped by category.
 2. **Design a schema.** `gd_design_schema(prompt="E-commerce customers with name, email, and signup date")` — proposes a `fields` array from plain English.
 3. **Generate the data.** `gd_generate_dataset(fields=..., num_rows=10, format="csv")` — returns the rows.
-4. **Refine if needed.** Call `gd_design_schema` again, this time passing `messages` (the running conversation) + `current_schema` (the prior result) together — it refines instead of proposing fresh.
+4. **Refine if needed.** Call `gd_design_schema` again, this time passing `messages` (the running conversation) + `current_schema` (the prior `proposed_schema` array) together — it refines instead of proposing fresh.
 
 Every tool returns the same envelope: `{"ok": true, "summary": "...", "data": {...}}` on success, or `{"ok": false, "error": {"code": ..., "message": ...}}` on failure — errors always tell you what to do next, never a raw stack trace.
 
@@ -116,30 +116,26 @@ v2.0.0 renames every tool (breaking change). Old name → new name:
 
 ## Reference
 
-All 7 tools, split by tier.
+All 7 tools work on every plan, within that plan's limits.
 
-### Free tier
-
-- **[gd_generate_dataset](./generate_data_mcp/server.py)** — Generate synthetic dataset rows from a field list. `format`: `csv`, `json`, `xml`, `parquet`, or `zip` (binary formats return base64-encoded).
+- **[gd_generate_dataset](./generate_data_mcp/server.py)** — Generate synthetic dataset rows from a field list. `format`: `csv`, `json`, `xml`, `yaml`, `sql`, `jsonl`, `parquet`, `xlsx`, or `hf-datasets` (`parquet`, `xlsx` and `hf-datasets` return base64-encoded).
 - **[gd_list_field_types](./generate_data_mcp/server.py)** — List all available field types grouped by category. Takes no arguments.
 - **[gd_get_field_type_options](./generate_data_mcp/server.py)** — Get the configuration option schema for one field type. `field_type` must match `^[a-z0-9_]+$`.
 - **[gd_design_schema](./generate_data_mcp/server.py)** — Design a dataset schema from natural language, or refine an existing one — one tool for both the first proposal and follow-up conversation turns.
 - **[gd_get_usage](./generate_data_mcp/server.py)** — Get current API key usage stats: calls today, tier, limits. Takes no arguments.
 
-### Premium tier
-
-Requires a Premium API key — Free-tier keys get a `tier_forbidden` error.
-
 - **[gd_list_projects](./generate_data_mcp/server.py)** — List the user's Projects, paginated (`limit`/`offset`, default 20/0).
-- **[gd_generate_project](./generate_data_mcp/server.py)** — Generate all tables in a Project and download the result. Same format/binary rules as `gd_generate_dataset`.
+- **[gd_generate_project](./generate_data_mcp/server.py)** — Generate all tables in a Project and download the result. `format`: `zip`, `xlsx`, `neo4j` (base64-encoded), `jsonld`, or `bundle`.
 
 ### Tier limits (API key)
 
-| Capability | Free | Premium |
-|------------|------|---------|
-| Max rows / request | 100 | 100,000 |
+| Capability | Free | Pro |
+|------------|------|-----|
+| Max rows / request | 100 | 10,000 |
 | Max columns | 10 | 50 |
-| Formats | CSV | CSV, JSON, XML, Parquet |
+| Max tables / project | 3 | 20 |
+| Dataset formats | CSV | CSV, JSON, XML, YAML, SQL, JSONL, Parquet, XLSX, HF Datasets |
+| Project formats | ZIP | ZIP, XLSX, Neo4j, JSON-LD, bundle |
 | Daily API calls | 10 | 1,000 |
 
 Limits are enforced by the Django API, not this MCP server.
@@ -149,7 +145,7 @@ Limits are enforced by the Django API, not this MCP server.
 | Variable | Required | Default |
 |----------|----------|---------|
 | `GENERATE_DATA_API_KEY` | Yes | — |
-| `GENERATE_DATA_API_BASE_URL` | No | `https://api.generate-data.com` |
+| `GENERATE_DATA_API_BASE_URL` | No | `https://generate-data.com` |
 
 ## Troubleshooting
 
@@ -159,7 +155,7 @@ Limits are enforced by the Django API, not this MCP server.
 | HTTP 401 / `auth_failed` | Invalid or deactivated key |
 | HTTP 429 / `rate_limited` | Per-minute or daily cap hit; wait or upgrade tier |
 | HTTP 403 / `tier_forbidden` | Free tier lacks access; upgrade plan |
-| `unsupported_format` | `format` must be one of `csv`, `json`, `xml`, `parquet`, `zip` |
+| `unsupported_format` | Use a format listed for that tool: datasets and Projects support different formats |
 | `invalid_input` on a field type or project ID | Value failed server-side validation before any request was sent — check spelling/type |
 
 ## Development

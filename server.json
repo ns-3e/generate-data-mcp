@@ -7,12 +7,12 @@
     "url": "https://github.com/ns-3e/generate-data-mcp",
     "source": "github"
   },
-  "version": "2.0.1",
+  "version": "2.0.2",
   "packages": [
     {
       "registryType": "pypi",
       "identifier": "generate-data-mcp",
-      "version": "2.0.1",
+      "version": "2.0.2",
       "transport": {
         "type": "stdio"
       },
@@ -26,7 +26,7 @@
         },
         {
           "name": "GENERATE_DATA_API_BASE_URL",
-          "description": "Override the Generate-Data.com API base URL (defaults to https://api.generate-data.com).",
+          "description": "Override the Generate-Data.com API base URL (defaults to https://generate-data.com).",
           "isRequired": false,
           "isSecret": false,
           "format": "string"

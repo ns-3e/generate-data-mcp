@@ -6,15 +6,15 @@ title: Generate-Data.com
 description: >-
   MCP server for Generate-Data.com — generate synthetic datasets from a field
   schema, design schemas from natural language, discover field types, check
-  API usage, and (Premium) list/generate multi-table Projects.
-image: ns-3e/generate-data-mcp:2.0.0
+  API usage, and list/generate multi-table Projects.
+image: ns-3e/generate-data-mcp:2.0.2
 type: server
 source:
   project: https://github.com/ns-3e/generate-data-mcp
   branch: main
 tools:
   - name: gd_generate_dataset
-    description: Generate synthetic dataset rows from a field list (CSV/JSON/XML/Parquet/ZIP).
+    description: Generate synthetic dataset rows from a field list (CSV, JSON, Parquet, XLSX and more).
   - name: gd_list_field_types
     description: List all available field types grouped by category.
   - name: gd_get_field_type_options
@@ -24,9 +24,9 @@ tools:
   - name: gd_get_usage
     description: Get current API key usage stats (calls today, tier, limits).
   - name: gd_list_projects
-    description: List the user's Projects (Premium tier only, paginated).
+    description: List the user's Projects (paginated).
   - name: gd_generate_project
-    description: Generate all tables in a Project and download the result (Premium tier only).
+    description: Generate all tables in a Project and download the result.
 secrets:
   - name: GENERATE_DATA_API_KEY
     env: GENERATE_DATA_API_KEY
@@ -36,5 +36,5 @@ config:
   - name: GENERATE_DATA_API_BASE_URL
     env: GENERATE_DATA_API_BASE_URL
     required: false
-    default: https://api.generate-data.com
+    default: https://generate-data.com
     description: Override the Generate-Data.com API base URL (e.g. for local development).

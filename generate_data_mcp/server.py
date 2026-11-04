@@ -7,7 +7,7 @@ DOC: F-002 rebuild renames the 5 free-tier tools per the frozen contract
 merged into one `gd_design_schema` (first call proposes; passing both `messages`
 and `current_schema` refines), `get_api_usage`->`gd_get_usage`. This is a
 breaking rename for any existing MCP client config pointing at the old names.
-Premium tools rebuilt by F-003 per the same contract:
+Project tools rebuilt by F-003 per the same contract:
 `list_projects`->`gd_list_projects` (paginated), `generate_project`->
 `gd_generate_project` (binary-aware — fixes the F-001/B-001 corruption bug
 where zip bytes were force-decoded as utf-8).
@@ -46,8 +46,54 @@ def _client() -> GenerateDataClient:
     return _client_singleton
 
 
-_DATA_FORMATS = frozenset({'csv', 'json', 'xml', 'parquet', 'zip'})
-_BINARY_FORMATS = frozenset({'parquet', 'zip'})
+# These mirror API_LIMITS in the backend's api/plan_config.py (the top tier's
+# lists); the monorepo's test_mcp_client_contract.py fails if they drift.
+_DATASET_FORMATS = frozenset({'csv', 'json', 'xml', 'parquet', 'xlsx', 'yaml', 'sql', 'jsonl', 'hf-datasets'})
+_PROJECT_FORMATS = frozenset({'zip', 'xlsx', 'neo4j', 'jsonld', 'bundle'})
+_BINARY_FORMATS = frozenset({'parquet', 'xlsx', 'hf-datasets', 'zip', 'neo4j'})
+_PARQUET_MAGIC = b'PAR1'
+_ZIP_MAGIC = b'PK'  # xlsx, hf-datasets and neo4j are all ZIP containers
+
+
+def _download_problem(fmt: str, response: Any) -> str | None:
+    """Why a 2xx body is not really the requested file, or None if it looks right.
+
+    A proxy or challenge page can answer 200 with HTML, and a redirect that is
+    not followed has an empty body; neither may be reported as generated data.
+    """
+    content = response.content
+    if not content:
+        return 'an empty response body'
+    if 'text/html' in response.headers.get('content-type', '').lower():
+        return 'an HTML page instead of data'
+    if fmt in _BINARY_FORMATS:
+        magic = _PARQUET_MAGIC if fmt == 'parquet' else _ZIP_MAGIC
+        if not content.startswith(magic):
+            return f'a body that is not a valid {fmt} file'
+    return None
+
+
+def _render_download(fmt: str, response: Any, summary: str) -> str:
+    """Turn a generate response into the success envelope, or an error if the
+    status or body shows the data did not actually arrive."""
+    if response.status_code >= 300:
+        try:
+            body = response.json()
+        except Exception:
+            body = None
+        return _err_from_status(response.status_code, body)
+    problem = _download_problem(fmt, response)
+    if problem:
+        return _err(
+            'upstream_error',
+            f'The API returned {problem}. Check GENERATE_DATA_API_BASE_URL, then retry later.',
+            details={'status': response.status_code},
+        )
+    if fmt in _BINARY_FORMATS:
+        data = _encode_binary(fmt, response.content)
+    else:
+        data = _encode_text(fmt, response.text)
+    return _ok(f"{summary} as {fmt.upper()} ({data['size_bytes']:,} bytes).", data)
 
 
 def _classify_http_error(status_code: int, body: Any) -> tuple[str, str, bool]:
@@ -99,37 +145,26 @@ def gd_generate_dataset(
     wants actual generated data (as opposed to schema design or field-type
     discovery). `fields` is a list of `{"name": str, "type": str, "options": dict}`
     (get valid `type` values from `gd_list_field_types`/`gd_get_field_type_options`).
-    `format` must be one of `csv`, `json`, `xml`, `parquet`, `zip` (anything else
-    returns an `unsupported_format` error). `num_rows` caps upstream row count;
+    `format` is one of `csv`, `json`, `xml`, `yaml`, `sql`, `jsonl`, `parquet`,
+    `xlsx`, `hf-datasets`; Free keys can only use `csv` (others return
+    `tier_forbidden`). `num_rows` is capped by plan: 100 on Free, 10,000 on Pro.
     `settings` is an optional passthrough dict of generation settings.
-    Returns the JSON envelope: on success `data.content` (csv/json/xml) or
-    `data.content_base64` (parquet/zip, base64-encoded — never decode these as
-    utf-8) plus `data.size_bytes`/`data.truncated`. On failure returns a
-    corrective error envelope (never raises)."""
-    if format not in _DATA_FORMATS:
+    Returns the JSON envelope: on success `data.content` (text formats) or
+    `data.content_base64` (`parquet`, `xlsx`, `hf-datasets` — never decode these
+    as utf-8) plus `data.size_bytes`/`data.truncated`. On failure returns a
+    corrective error envelope."""
+    fmt = format.lower()
+    if fmt not in _DATASET_FORMATS:
         return _err(
             'unsupported_format',
-            f'format must be one of {sorted(_DATA_FORMATS)}; got {format!r}.',
+            f'format must be one of {sorted(_DATASET_FORMATS)}; got {format!r}.',
         )
     client = _client()
     try:
-        response = client.generate_data(fields, num_rows=num_rows, fmt=format, settings=settings)
+        response = client.generate_data(fields, num_rows=num_rows, fmt=fmt, settings=settings)
     except httpx.HTTPError as exc:
         return _err('upstream_unavailable', f'Could not reach the Generate-Data.com API: {exc.__class__.__name__}. Retry later.', retriable=True)
-
-    if response.status_code >= 400:
-        try:
-            body = response.json()
-        except Exception:
-            body = None
-        return _err_from_status(response.status_code, body)
-
-    if format in _BINARY_FORMATS:
-        data = _encode_binary(format, response.content)
-    else:
-        data = _encode_text(format, response.text)
-    summary = f"Generated {num_rows} rows of {format.upper()} data ({data['size_bytes']:,} bytes)."
-    return _ok(summary, data)
+    return _render_download(fmt, response, f'Generated {num_rows} rows')
 
 
 @mcp.tool()
@@ -171,26 +206,27 @@ def gd_get_field_type_options(field_type: str) -> str:
 
 @mcp.tool()
 def gd_design_schema(
-    prompt: str,
+    prompt: str | None = None,
     locale: str = 'en_US',
     messages: list[dict[str, Any]] | None = None,
-    current_schema: dict[str, Any] | None = None,
+    current_schema: list[dict[str, Any]] | None = None,
 ) -> str:
     """Design a dataset schema from natural language — one tool for both the
     first proposal and follow-up refinements. Behavior branches on args:
-    - First call (propose): pass only `prompt` (and optionally `locale`, e.g.
-      'en_US', 'fr_FR'). `messages`/`current_schema` left unset.
-    - Refine call: pass BOTH `messages` (the running conversation, list of
+    - Propose: pass `prompt` (and optionally `locale`).
+    - Refine: pass BOTH `messages` (the running conversation, a list of
       `{"role": "user"|"assistant", "content": str}`) AND `current_schema` (the
-      schema object returned by the prior call) together — `prompt` is still
-      required by the signature but is not sent upstream for a refine call.
-      If only one of `messages`/`current_schema` is set, this falls back to
-      propose using `prompt`.
-    Returns the proposed/refined schema in `data` (upstream `proposed_schema`
-    shape), ready to hand to `gd_generate_dataset` as `fields`."""
+      `data.proposed_schema` array from the prior call). `prompt` is not used.
+    Passing only one of `messages`/`current_schema`, or neither of them and no
+    `prompt`, returns `invalid_input`. Returns `data.proposed_schema`, an array
+    you can pass directly to `gd_generate_dataset` as `fields`."""
+    if (messages is None) != (current_schema is None):
+        return _err('invalid_input', 'To refine, pass both messages and current_schema. To propose, pass only prompt.')
+    if messages is None and not (prompt or '').strip():
+        return _err('invalid_input', 'prompt is required to propose a schema.')
     client = _client()
     try:
-        if messages and current_schema:
+        if messages is not None:
             result = client.refine_schema(messages, current_schema)
             summary = 'Refined the schema based on the conversation.'
         else:
@@ -221,19 +257,13 @@ def gd_get_usage() -> str:
     return _ok(summary, result)
 
 
-# DOC: gd_list_projects/gd_generate_project are Premium-tier-only (contract
-# Sec. 1) — a valid but non-Premium GENERATE_DATA_API_KEY gets a `tier_forbidden`
-# error from upstream (403 + tier/premium/upgrade/plan keyword), classified by
-# _classify_http_error above; the agent should tell the user to upgrade their
-# Generate-Data.com plan rather than retry.
 @mcp.tool()
 def gd_list_projects(limit: int = 20, offset: int = 0) -> str:
-    """List the user's Projects (Premium tier only). Use this to discover
+    """List the user's Projects. Use this to discover
     `project_id` values before calling `gd_generate_project`. `limit` (default
     20, max 100) and `offset` (default 0) page through the results; results are
     paginated client-side since the upstream API returns the full list.
-    Non-Premium API keys get a `tier_forbidden` error — upgrade the
-    Generate-Data.com plan to use this tool. Returns the page in `data`
+    Returns the page in `data`
     (`items`, `limit`, `offset`, `total_count`, `has_more`, `next_offset`)."""
     try:
         limit, offset = _validate_pagination(limit, offset)
@@ -253,44 +283,31 @@ def gd_list_projects(limit: int = 20, offset: int = 0) -> str:
 
 @mcp.tool()
 def gd_generate_project(project_id: int, format: str = 'zip') -> str:
-    """Generate all tables in a Project and download the result (Premium tier
-    only). `project_id` must be a positive integer (get one from
-    `gd_list_projects`). `format` must be one of `csv`, `json`, `xml`,
-    `parquet`, `zip` (default `zip`; anything else returns
-    `unsupported_format`). Non-Premium API keys get a `tier_forbidden` error —
-    upgrade the Generate-Data.com plan to use this tool. Returns the JSON
-    envelope: on success `data.content` (csv/json/xml) or
-    `data.content_base64` (parquet/zip, base64-encoded — never decode these as
-    utf-8) plus `data.size_bytes`/`data.truncated`. On failure returns a
-    corrective error envelope (never raises)."""
+    """Generate all tables in a Project and download the result. `project_id`
+    must be a positive integer (get one from `gd_list_projects`). `format` is one
+    of `zip` (default; one CSV per table), `xlsx`, `neo4j`, `jsonld`, `bundle`.
+    Free keys can only use `zip` (others return `tier_forbidden`), and a project's
+    rows and columns must fit the plan's limits. Returns the JSON envelope: on
+    success `data.content_base64` (`zip`, `xlsx`, `neo4j` — never decode these as
+    utf-8) or `data.content` (`jsonld`, `bundle`) plus
+    `data.size_bytes`/`data.truncated`. On failure returns a corrective error
+    envelope."""
     try:
         project_id = _validate_project_id(project_id)
     except ValueError as exc:
         return _err('invalid_input', str(exc))
-    if format not in _DATA_FORMATS:
+    fmt = format.lower()
+    if fmt not in _PROJECT_FORMATS:
         return _err(
             'unsupported_format',
-            f'format must be one of {sorted(_DATA_FORMATS)}; got {format!r}.',
+            f'format must be one of {sorted(_PROJECT_FORMATS)}; got {format!r}.',
         )
     client = _client()
     try:
-        response = client.generate_project(project_id, fmt=format)
+        response = client.generate_project(project_id, fmt=fmt)
     except httpx.HTTPError as exc:
         return _err('upstream_unavailable', f'Could not reach the Generate-Data.com API: {exc.__class__.__name__}. Retry later.', retriable=True)
-
-    if response.status_code >= 400:
-        try:
-            body = response.json()
-        except Exception:
-            body = None
-        return _err_from_status(response.status_code, body)
-
-    if format in _BINARY_FORMATS:
-        data = _encode_binary(format, response.content)
-    else:
-        data = _encode_text(format, response.text)
-    summary = f"Generated project {project_id} as {format.upper()} ({data['size_bytes']:,} bytes)."
-    return _ok(summary, data)
+    return _render_download(fmt, response, f'Generated project {project_id}')
 
 
 def main():

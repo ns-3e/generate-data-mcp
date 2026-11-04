@@ -19,6 +19,11 @@ def test_client_requires_api_key():
             GenerateDataClient()
 
 
+def test_default_base_url_is_a_routed_host():
+    with patch.dict('os.environ', {}, clear=True):
+        assert GenerateDataClient(api_key='k').base_url == 'https://generate-data.com'
+
+
 def test_client_reuses_one_httpx_client(client):
     """brief F-008: one reused httpx.Client per GenerateDataClient instance."""
     import httpx
@@ -93,14 +98,15 @@ def test_refine_schema(client):
     mock_response.json.return_value = {'proposed_schema': []}
 
     messages = [{'role': 'user', 'content': 'add VAT field'}]
-    schema = {'fields': []}
+    schema = [{'name': 'id', 'type': 'row_number', 'options': {}}]
     with patch.object(client._http, 'post', return_value=mock_response) as post:
         data = client.refine_schema(messages, schema)
 
     post.assert_called_once()
     body = post.call_args[1]['json']
     assert body['messages'] == messages
-    assert body['current_schema'] == schema
+    assert body['schema'] == schema
+    assert 'current_schema' not in body
     assert 'proposed_schema' in data
 
 
@@ -145,7 +151,7 @@ def test_generate_data_binary_format_sends_accept_star(client):
     mock_response.headers = {'content-type': 'application/zip'}
 
     with patch.object(client._http, 'post', return_value=mock_response) as post:
-        client.generate_data([{'name': 'first_name', 'type': 'first_name', 'options': {}}], fmt='zip')
+        client.generate_data([{'name': 'first_name', 'type': 'first_name', 'options': {}}], fmt='parquet')
 
     assert post.call_args[1]['headers']['Accept'] == '*/*'
 
@@ -162,7 +168,8 @@ def test_generate_data_text_format_keeps_accept_json(client):
     assert post.call_args[1]['headers']['Accept'] == 'application/json'
 
 
-def test_generate_project_posts_with_format_param(client):
+def test_generate_project_sends_format_in_body_not_query(client):
+    """`?format=` is DRF renderer selection: the real API answers 404 to it."""
     mock_response = MagicMock()
     mock_response.status_code = 200
     mock_response.content = b'PK\x03\x04fake-zip-bytes'
@@ -174,6 +181,7 @@ def test_generate_project_posts_with_format_param(client):
     post.assert_called_once()
     args, kwargs = post.call_args
     assert args[0] == 'http://test/api/v2/projects/42/generate'
-    assert kwargs['params'] == {'format': 'zip'}
+    assert kwargs['json'] == {'format': 'zip'}
+    assert 'params' not in kwargs
     assert kwargs['headers']['Accept'] == '*/*'
     assert resp.status_code == 200

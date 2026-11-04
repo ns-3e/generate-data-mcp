@@ -31,6 +31,10 @@ def _http_status_error(status_code: int, body: dict) -> httpx.HTTPStatusError:
     return httpx.HTTPStatusError(f'{status_code} error', request=request, response=response)
 
 
+def _download(content: bytes, content_type: str = 'text/csv', status: int = 200) -> httpx.Response:
+    return httpx.Response(status, content=content, headers={'content-type': content_type})
+
+
 def _assert_ok_envelope(result: str) -> dict:
     parsed = json.loads(result)
     assert parsed['ok'] is True
@@ -53,9 +57,7 @@ def _assert_err_envelope(result: str, api_key: str = '00000000-0000-0000-0000-00
 # ---------------------------------------------------------------------------
 
 def test_gd_generate_dataset_success_text():
-    mock_response = MagicMock()
-    mock_response.status_code = 200
-    mock_response.text = 'first_name\nAlice\nBob'
+    mock_response = _download(b'first_name\nAlice\nBob')
 
     with patch('generate_data_mcp.server._client') as mock_client:
         mock_client.return_value.generate_data.return_value = mock_response
@@ -67,31 +69,51 @@ def test_gd_generate_dataset_success_text():
 
 
 def test_gd_generate_dataset_binary_round_trip():
-    """Regression for F-001/B-001: zip bytes must survive base64 round-trip
+    """Regression for F-001/B-001: binary bytes must survive base64 round-trip
     unmangled, never force-decoded as utf-8."""
-    raw = b'PK\x03\x04\xff\xfe\x00\x01binary-payload\x80\x81\x82'
-    mock_response = MagicMock()
-    mock_response.status_code = 200
-    mock_response.content = raw
+    raw = b'PAR1\xff\xfe\x00\x01binary-payload\x80\x81\x82'
+    mock_response = _download(raw, 'application/octet-stream')
 
     with patch('generate_data_mcp.server._client') as mock_client:
         mock_client.return_value.generate_data.return_value = mock_response
-        result = gd_generate_dataset(fields=[{'name': 'x', 'type': 'first_name', 'options': {}}], format='zip')
+        result = gd_generate_dataset(fields=[{'name': 'x', 'type': 'first_name', 'options': {}}], format='parquet')
 
     parsed = _assert_ok_envelope(result)
     assert parsed['data']['encoding'] == 'base64'
-    assert parsed['data']['format'] == 'zip'
+    assert parsed['data']['format'] == 'parquet'
     decoded = base64.b64decode(parsed['data']['content_base64'])
     assert decoded == raw
 
 
 def test_gd_generate_dataset_unsupported_format_never_calls_client():
     with patch('generate_data_mcp.server._client') as mock_client:
-        result = gd_generate_dataset(fields=[], format='yaml')
+        result = gd_generate_dataset(fields=[], format='zip')
 
     parsed = _assert_err_envelope(result)
     assert parsed['error']['code'] == 'unsupported_format'
     mock_client.assert_not_called()
+
+
+def test_gd_generate_dataset_format_is_case_insensitive():
+    with patch('generate_data_mcp.server._client') as mock_client:
+        mock_client.return_value.generate_data.return_value = _download(b'a\n1\n')
+        result = gd_generate_dataset(fields=[{'name': 'a', 'type': 'integer'}], format='CSV')
+
+    _assert_ok_envelope(result)
+    assert mock_client.return_value.generate_data.call_args.kwargs['fmt'] == 'csv'
+
+
+@pytest.mark.parametrize('response', [
+    _download(b'', status=301),
+    _download(b''),
+    _download(b'<html>challenge</html>', 'text/html; charset=utf-8'),
+], ids=['redirect', 'empty', 'html'])
+def test_gd_generate_dataset_bad_upstream_body_is_never_success(response):
+    with patch('generate_data_mcp.server._client') as mock_client:
+        mock_client.return_value.generate_data.return_value = response
+        result = gd_generate_dataset(fields=[{'name': 'a', 'type': 'integer'}])
+
+    assert _assert_err_envelope(result)['error']['code'] == 'upstream_error'
 
 
 def test_gd_generate_dataset_upstream_unavailable():
@@ -190,26 +212,40 @@ def test_gd_get_field_type_options_upstream_error():
 
 def test_gd_design_schema_propose_success():
     with patch('generate_data_mcp.server._client') as mock_client:
-        mock_client.return_value.propose_schema.return_value = {'proposed_schema': {'fields': []}}
+        mock_client.return_value.propose_schema.return_value = {'proposed_schema': []}
         result = gd_design_schema(prompt='customers with email')
 
     parsed = _assert_ok_envelope(result)
-    assert parsed['data']['proposed_schema'] == {'fields': []}
+    assert parsed['data']['proposed_schema'] == []
     mock_client.return_value.propose_schema.assert_called_once_with('customers with email', locale='en_US')
     mock_client.return_value.refine_schema.assert_not_called()
 
 
 def test_gd_design_schema_refine_success():
     messages = [{'role': 'user', 'content': 'add VAT'}]
-    current = {'fields': [{'name': 'x'}]}
+    current = [{'name': 'x', 'type': 'email', 'options': {}}]
     with patch('generate_data_mcp.server._client') as mock_client:
-        mock_client.return_value.refine_schema.return_value = {'proposed_schema': {'fields': [{'name': 'x'}, {'name': 'vat'}]}}
-        result = gd_design_schema(prompt='irrelevant here', messages=messages, current_schema=current)
+        mock_client.return_value.refine_schema.return_value = {'proposed_schema': [{'name': 'x'}, {'name': 'vat'}]}
+        result = gd_design_schema(messages=messages, current_schema=current)
 
     parsed = _assert_ok_envelope(result)
     mock_client.return_value.refine_schema.assert_called_once_with(messages, current)
     mock_client.return_value.propose_schema.assert_not_called()
-    assert len(parsed['data']['proposed_schema']['fields']) == 2
+    assert len(parsed['data']['proposed_schema']) == 2
+
+
+@pytest.mark.parametrize('kwargs', [
+    {},
+    {'prompt': '   '},
+    {'prompt': 'pets', 'messages': [{'role': 'user', 'content': 'a'}]},
+    {'prompt': 'pets', 'current_schema': []},
+], ids=['nothing', 'blank-prompt', 'messages-only', 'schema-only'])
+def test_gd_design_schema_rejects_ambiguous_args_without_calling_client(kwargs):
+    with patch('generate_data_mcp.server._client') as mock_client:
+        result = gd_design_schema(**kwargs)
+
+    assert _assert_err_envelope(result)['error']['code'] == 'invalid_input'
+    mock_client.assert_not_called()
 
 
 def test_gd_design_schema_upstream_unavailable():
@@ -273,9 +309,9 @@ def test_gd_list_projects_invalid_pagination_never_calls_client():
     mock_client.assert_not_called()
 
 
-def test_gd_list_projects_tier_forbidden():
+def test_403_mentioning_a_plan_maps_to_tier_forbidden():
     with patch('generate_data_mcp.server._client') as mock_client:
-        mock_client.return_value.list_projects.side_effect = _http_status_error(403, {'error': 'Requires Premium tier'})
+        mock_client.return_value.list_projects.side_effect = _http_status_error(403, {'error': 'Not available on the FREE API plan'})
         result = gd_list_projects()
 
     parsed = _assert_err_envelope(result)
@@ -287,24 +323,20 @@ def test_gd_list_projects_tier_forbidden():
 # ---------------------------------------------------------------------------
 
 def test_gd_generate_project_success_text():
-    mock_response = MagicMock()
-    mock_response.status_code = 200
-    mock_response.text = 'table,rows\ncustomers,10'
+    mock_response = _download(b'{"tables":{"customers":[]}}', 'application/json')
 
     with patch('generate_data_mcp.server._client') as mock_client:
         mock_client.return_value.generate_project.return_value = mock_response
-        result = gd_generate_project(project_id=7, format='csv')
+        result = gd_generate_project(project_id=7, format='bundle')
 
     parsed = _assert_ok_envelope(result)
-    assert parsed['data']['content'] == 'table,rows\ncustomers,10'
+    assert parsed['data']['content'] == '{"tables":{"customers":[]}}'
 
 
 def test_gd_generate_project_binary_round_trip():
     """Regression for F-001/B-001, project export path."""
     raw = b'PK\x03\x04\xff\xfe\x00\x01project-zip-bytes\x80\x81\x82'
-    mock_response = MagicMock()
-    mock_response.status_code = 200
-    mock_response.content = raw
+    mock_response = _download(raw, 'application/zip')
 
     with patch('generate_data_mcp.server._client') as mock_client:
         mock_client.return_value.generate_project.return_value = mock_response
@@ -314,6 +346,23 @@ def test_gd_generate_project_binary_round_trip():
     assert parsed['data']['encoding'] == 'base64'
     decoded = base64.b64decode(parsed['data']['content_base64'])
     assert decoded == raw
+
+
+def test_gd_generate_project_rejects_non_zip_body_labelled_zip():
+    with patch('generate_data_mcp.server._client') as mock_client:
+        mock_client.return_value.generate_project.return_value = _download(b'not a zip', 'application/zip')
+        result = gd_generate_project(project_id=7)
+
+    assert _assert_err_envelope(result)['error']['code'] == 'upstream_error'
+
+
+@pytest.mark.parametrize('fmt', ['csv', 'json', 'xml', 'parquet'])
+def test_gd_generate_project_rejects_dataset_only_formats(fmt):
+    with patch('generate_data_mcp.server._client') as mock_client:
+        result = gd_generate_project(project_id=7, format=fmt)
+
+    assert _assert_err_envelope(result)['error']['code'] == 'unsupported_format'
+    mock_client.assert_not_called()
 
 
 def test_gd_generate_project_invalid_id_never_calls_client():
@@ -379,9 +428,7 @@ def test_e2e_discover_field_type_then_generate_dataset():
         chosen_type = catalog_result['data']['categories']['personal'][0]
         assert chosen_type == 'first_name'
 
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-        mock_response.text = f'{chosen_type}\nAlice\nBob'
+        mock_response = _download(f'{chosen_type}\nAlice\nBob'.encode())
         mock_client.return_value.generate_data.return_value = mock_response
 
         dataset_result = json.loads(

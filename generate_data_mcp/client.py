@@ -11,9 +11,10 @@ from typing import Any, Optional
 
 import httpx
 
-DEFAULT_BASE_URL = 'https://api.generate-data.com'
+DEFAULT_BASE_URL = 'https://generate-data.com'
 
-_BINARY_FORMATS = frozenset({'parquet', 'zip'})
+# Formats the API returns as binary bodies. `hf-datasets` and `neo4j` are ZIPs.
+_BINARY_FORMATS = frozenset({'parquet', 'xlsx', 'hf-datasets', 'zip', 'neo4j'})
 
 
 class GenerateDataClient:
@@ -89,10 +90,10 @@ class GenerateDataClient:
         r.raise_for_status()
         return r.json()
 
-    def refine_schema(self, messages: list[dict], current_schema: dict) -> dict:
+    def refine_schema(self, messages: list[dict], schema: list[dict]) -> dict:
         r = self._http.post(
             self._url('/api/v2/ai/schema/refine'),
-            json={'messages': messages, 'current_schema': current_schema},
+            json={'messages': messages, 'schema': schema},
             headers=self._headers(),
             timeout=60,
         )
@@ -113,7 +114,9 @@ class GenerateDataClient:
         accept = '*/*' if fmt in _BINARY_FORMATS else 'application/json'
         return self._http.post(
             self._url(f'/api/v2/projects/{project_id}/generate'),
-            params={'format': fmt},
+            # Must be in the body: DRF reserves `?format=` for renderer selection
+            # and answers 404 for any value it has no renderer for (e.g. zip).
+            json={'format': fmt},
             headers=self._headers(accept=accept),
             timeout=120,
         )

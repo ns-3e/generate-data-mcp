@@ -5,6 +5,40 @@ All notable changes to `generate-data-mcp` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.2] - 2026-11-04
+
+### Fixed
+
+- **The default API host now works.** The default base URL was
+  `https://api.generate-data.com`, which did not resolve, so every tool failed
+  unless `GENERATE_DATA_API_BASE_URL` was set. It is now `https://generate-data.com`.
+- **`gd_generate_project` failed on every format except `json`,** with a misleading
+  `not_found`: it sent the format as `?format=`, which the API reserves. With `json`
+  it returned a ZIP decoded as text and reported success. The format now goes in
+  the request body.
+- **`gd_design_schema` refine always failed** with a 422. It now sends `schema`, and
+  `current_schema` is the `proposed_schema` array the previous call returned.
+- **Bad upstream responses are no longer reported as generated data.** A redirect,
+  an empty body, an HTML page or a corrupt binary now returns `upstream_error`.
+- Tool `format` lists now match what the API accepts, and `format` is
+  case-insensitive. `gd_generate_dataset` gains `xlsx`, `yaml`, `sql`, `jsonl` and
+  `hf-datasets` and drops `zip`. `gd_generate_project` gains `xlsx`, `neo4j`,
+  `jsonld` and `bundle` and drops `csv`, `json`, `xml` and `parquet`. The dropped
+  values never returned usable output.
+- `gd_design_schema` now returns `invalid_input` when given only one of
+  `messages`/`current_schema` instead of silently proposing. `prompt` is optional
+  when refining.
+- Docs: Pro is 10,000 rows per request, not 100,000, and Free keys can use Projects.
+
+### Changed
+
+- Minimum `mcp` is now 1.30.0. Declared minimums below it did not import.
+
+### Added
+
+- End-to-end tests that run a real MCP client against the server over stdio, a CI
+  job on the lowest supported dependencies, and an optional nightly smoke test.
+
 ## [2.0.1] - 2026-08-03
 
 Non-breaking. Adds an `mcp-name: io.github.ns-3e/generate-data-mcp` ownership-verification
@@ -87,4 +121,6 @@ upstream list.
   `^[a-z0-9_]+$`, `project_id` must be a positive integer, `limit`/`offset` are
   range-checked.
 
+[2.0.2]: https://github.com/ns-3e/generate-data-mcp/releases/tag/v2.0.2
+[2.0.1]: https://github.com/ns-3e/generate-data-mcp/releases/tag/v2.0.1
 [2.0.0]: https://github.com/ns-3e/generate-data-mcp/releases/tag/v2.0.0

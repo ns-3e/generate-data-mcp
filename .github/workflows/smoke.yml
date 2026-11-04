@@ -1,0 +1,22 @@
+name: smoke
+
+# Runs against a real deployment. Skips itself until the repository secret
+# GENERATE_DATA_SMOKE_API_KEY is set.
+on:
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    env:
+      GENERATE_DATA_SMOKE_API_KEY: ${{ secrets.GENERATE_DATA_SMOKE_API_KEY }}
+      GENERATE_DATA_API_BASE_URL: https://qa-test.generate-data.com
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -e ".[dev]"
+      - run: pytest tests/test_smoke_live.py -v
