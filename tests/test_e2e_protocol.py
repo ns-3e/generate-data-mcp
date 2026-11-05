@@ -862,6 +862,21 @@ def test_json_meta_warnings_are_surfaced_and_deduplicated(api_url):
     assert 'WARNING' in result['summary']
 
 
+def test_a_warning_in_both_header_and_body_counts_once_despite_its_code_prefix(api_url):
+    body = {'records': [{'id': 1}], 'meta': {'warnings': [{'code': 'ai_parse_failed', 'message': 'no provider'}]}}
+    FakeApi.override = (200, body, 'application/json', {'X-Generation-Warnings': '["ai_parse_failed: no provider"]'})
+    [result] = _call_tools(api_url, ('gd_generate_dataset', {'fields': FIELDS, 'format': 'json'}))
+    assert result['data']['warnings'] == ['no provider']
+    assert 'generation reported 1 problem' in result['summary']
+
+
+def test_a_warning_with_an_ordinary_colon_keeps_its_text(api_url):
+    body = {'records': [{'id': 1}]}
+    FakeApi.override = (200, body, 'application/json', {'X-Generation-Warnings': '["Note: rows were limited"]'})
+    [result] = _call_tools(api_url, ('gd_generate_dataset', {'fields': FIELDS, 'format': 'json'}))
+    assert result['data']['warnings'] == ['Note: rows were limited']
+
+
 # ---------------------------------------------------------------------------
 # Bodies that say 200 but aren't the file
 # ---------------------------------------------------------------------------
