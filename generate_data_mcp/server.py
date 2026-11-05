@@ -14,6 +14,7 @@ import io
 import json
 import logging
 import os
+import re
 import sys
 import zipfile
 from datetime import datetime, timedelta, timezone
@@ -475,6 +476,9 @@ def _inspect_download(fmt: str, content: bytes, content_type: str) -> tuple[str 
     return None, warnings if fmt == 'json' and isinstance(warnings, list) else []
 
 
+_WARNING_CODE_PREFIX = re.compile(r'^[a-z][a-z0-9_]*: ')
+
+
 def _warning_text(warning: Any) -> str:
     if isinstance(warning, dict) and isinstance(warning.get('message'), str):
         warning = warning['message']
@@ -494,7 +498,8 @@ def _generation_warnings(response: httpx.Response, embedded: list[Any]) -> list[
         except ValueError:
             parsed = None
         if isinstance(parsed, list):
-            found.extend(parsed)
+            # The header prefixes AI warnings with a code; the body holds the bare message.
+            found.extend(_WARNING_CODE_PREFIX.sub('', item) if isinstance(item, str) else item for item in parsed)
         else:
             found.append('The API reported generation warnings in a form this server could not read.')
     found.extend(embedded)

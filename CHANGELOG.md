@@ -5,6 +5,13 @@ All notable changes to `generate-data-mcp` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.1] - 2026-11-05
+
+### Fixed
+
+- A warning reported in both the `X-Generation-Warnings` header and a JSON body was counted
+  twice when the header prefixed it with a code.
+
 ## [2.2.0] - 2026-11-04
 
 ### Added
@@ -223,6 +230,7 @@ upstream list.
   `^[a-z0-9_]+$`, `project_id` must be a positive integer, `limit`/`offset` are
   range-checked.
 
+[2.2.1]: https://github.com/ns-3e/generate-data-mcp/releases/tag/v2.2.1
 [2.2.0]: https://github.com/ns-3e/generate-data-mcp/releases/tag/v2.2.0
 [2.1.0]: https://github.com/ns-3e/generate-data-mcp/releases/tag/v2.1.0
 [2.0.2]: https://github.com/ns-3e/generate-data-mcp/releases/tag/v2.0.2
